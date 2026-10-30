@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+node_modules/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+.risklens/
+.local-data/
+data/
+*cache*.json
+*.tmp
+*.log
+screenshots/
+reports/
+
+# dist/ is the source for this buildless frontend and is intentionally tracked.
