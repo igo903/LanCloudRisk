@@ -13,12 +13,14 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 import webbrowser
 import html
 import csv
 import io
 import sys
 import tempfile
+import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -51,7 +53,7 @@ def fetch(url):
     host = urllib.parse.urlsplit(url).hostname or ''
     referer = 'https://fundf10.eastmoney.com/' if host.startswith(('fund', 'fundf10')) else 'https://quote.eastmoney.com/' if host.endswith('eastmoney.com') else 'https://finance.sina.com.cn/'
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 RiskLensLocal/0.4.2',
+        'User-Agent': 'Mozilla/5.0 RiskLensLocal/0.7.0',
         'Referer': referer,
     })
     with NETWORK_LIMIT:
@@ -386,29 +388,211 @@ def load_nav(code):
             'value': latest['y'], 'source': '天天基金历史单位净值', 'url': url, 'fetched_at': now()}
 
 
-def load_external():
-    raw = fetch(QUOTE + ','.join(EXTERNAL_SYMBOLS)).decode('gb18030')
+# The score model lives in the browser; this layer preserves dated source evidence.
+GLOBAL_ASSETS = [
+    ('DXY', '美元指数', 'DX-Y.NYB', '点', 'macro', 10),
+    ('CNH', '美元/离岸人民币', 'CNH=X', 'CNH/USD', 'macro', 8),
+    ('US10Y', '10年期美债收益率', '^TNX', '%', 'yield', 7),
+    ('DJI', '道琼斯工业指数', '^DJI', '点', 'equity', 3),
+    ('IXIC', '纳斯达克综合指数', '^IXIC', '点', 'equity', 5),
+    ('N225', '日经225指数', '^N225', '点', 'equity', 3),
+    ('KOSPI', '韩国综合指数', '^KS11', '点', 'equity', 3),
+    ('SOX', '费城半导体指数 · SOX', '^SOX', '点', 'equity', 6),
+    ('usSOXX', 'iShares半导体ETF · SOXX', 'SOXX', 'USD', 'equity', 6),
+    ('usQQQ', 'Invesco纳指100ETF · QQQ', 'QQQ', 'USD', 'equity', 9),
+    ('hkHSTECH', '恒生科技指数', 'HSTECH.HK', '点', 'equity', 6),
+    ('A50', '富时中国A50指数', 'XIN9.FGI', '点', 'equity', 4),
+    ('GOLD', '黄金 · COMEX连续期货代理', 'GC=F', 'USD/盎司', 'metal', 3),
+    ('SILVER', '白银 · COMEX连续期货代理', 'SI=F', 'USD/盎司', 'metal', 2),
+    ('BTC', '比特币 / 美元', 'BTC-USD', 'USD', 'crypto', 5),
+    ('usNVDA', '英伟达', 'NVDA', 'USD', 'equity', 0),
+    ('usMU', '美光科技', 'MU', 'USD', 'equity', 0),
+    ('usTSM', '台积电ADR', 'TSM', 'USD', 'equity', 0),
+    ('usAVGO', '博通', 'AVGO', 'USD', 'equity', 0),
+    ('usVIX', 'VIX波动率指数', '^VIX', '点', 'volatility', 0),
+]
+
+
+def fetch_json_history(url):
+    # One retry for transient upstream gateway failures; never retry auth or rate-limit errors.
+    for attempt in range(2):
+        try:
+            return json.loads(fetch(url))
+        except urllib.error.HTTPError as exc:
+            if attempt or exc.code not in (502, 503, 504):
+                raise
+
+
+def external_changes(history, kind):
+    """N intervals require N+1 valid dated observations; yields use bp, not returns."""
+    out = {}
+    for n in (60, 250):
+        if len(history) > n:
+            a, b = history[-1]['close'], history[-n-1]['close']
+            out[str(n)] = {'value': (a-b)*100 if kind == 'yield' else (a/b-1)*100,
+                           'unit': 'bp' if kind == 'yield' else '%',
+                           'start': history[-n-1]['date'], 'end': history[-1]['date']}
+        else:
+            out[str(n)] = {'value': None, 'unit': 'bp' if kind == 'yield' else '%',
+                           'reason': '需要' + str(n+1) + '条有效日频观察值'}
+    return out
+
+
+def load_global_asset(asset):
+    symbol, name, ticker, unit, kind, weight = asset
+    url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker, safe='') + '?range=2y&interval=1d'
+    row = {'symbol': symbol, 'name': name, 'ticker': ticker, 'unit': unit, 'kind': kind, 'weight': weight,
+           'url': 'https://finance.yahoo.com/quote/' + urllib.parse.quote(ticker, safe='') + '/',
+           'source': 'Yahoo Finance 日频价格（非总回报）', 'provider_url': url, 'fetched_at': now()}
+    try:
+        result = json.loads(fetch(url))['chart']['result'][0]
+        meta = result['meta']
+        if meta.get('symbol', '').upper() != ticker.upper():
+            raise ValueError('标的身份不匹配')
+        stamps = result.get('timestamp') or []
+        closes = result['indicators']['quote'][0].get('close') or []
+        offset = dt.timezone(dt.timedelta(seconds=meta.get('gmtoffset', 0)))
+        values = {}
+        for stamp, close in zip(stamps, closes):
+            if isinstance(close, (int, float)) and math.isfinite(close) and close > 0:
+                day = dt.datetime.fromtimestamp(stamp, offset).date().isoformat()
+                if day <= dt.datetime.now(TZ).date().isoformat():
+                    values[day] = float(close)
+        history = [{'date': d, 'close': c} for d, c in sorted(values.items())]
+        if symbol == 'hkHSTECH' and len(history) < 251:
+            try:
+                fallback = 'https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get?param=hkHSTECH,day,,,600,qfq'
+                payload = json.loads(fetch(fallback))['data']['hkHSTECH']
+                rows = payload.get('day') or payload.get('qfqday') or []
+                for r in rows:
+                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(r[0])) and float(r[2]) > 0:
+                        values[r[0]] = float(r[2])
+                history = [{'date': d, 'close': c} for d, c in sorted(values.items()) if d <= dt.datetime.now(TZ).date().isoformat() and math.isfinite(c)][-756:]
+                row.update(history_source='腾讯恒生科技日线 + Yahoo最新日线', history_url=fallback)
+            except Exception as exc:
+                row['history_error'] = str(exc)[:150]
+        if symbol in ('CNH', 'A50') and len(history) < 251:
+            try:
+                secid, expected_code = ('133.USDCNH', 'USDCNH') if symbol == 'CNH' else ('100.XIN9', 'XIN9')
+                fallback = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + secid + '&klt=101&fqt=0&lmt=600&beg=0&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57'
+                row.update(history_source='东方财富' + expected_code + '历史日线', history_url=fallback)
+                payload = fetch_json_history(fallback)['data']
+                if payload['code'] != expected_code:
+                    raise ValueError('跨市场历史标的身份不匹配')
+                for r in payload.get('klines') or []:
+                    cells = r.split(',')
+                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', cells[0]) and float(cells[2]) > 0:
+                        values[cells[0]] = float(cells[2])
+                history = [{'date': d, 'close': c} for d, c in sorted(values.items()) if d <= dt.datetime.now(TZ).date().isoformat() and math.isfinite(c)][-756:]
+                row.update(history_source='东方财富' + expected_code + '日线 + Yahoo最新日线', history_url=fallback)
+            except Exception as exc:
+                row['history_error'] = str(exc)[:150]
+        if not history:
+            raise ValueError('缺少有效日线')
+        stamp = meta.get('regularMarketTime')
+        quote_time = dt.datetime.fromtimestamp(stamp, offset).isoformat() if stamp else history[-1]['date']
+        row.update(history=history, history_as_of=history[-1]['date'], price=history[-1]['close'],
+                   change=(history[-1]['close']/history[-2]['close']-1)*100 if len(history)>1 and kind != 'yield' else None,
+                   timestamp=quote_time, timezone=meta.get('exchangeTimezoneName', '供应商市场时区'),
+                   observation_basis='日频观察值；比特币含周末' if kind == 'crypto' else '供应商有效日线；不插值',
+                   returns=external_changes(history, kind),
+                   provisional=bool(history[-1]['date'] == dt.datetime.now(offset).date().isoformat() and (kind == 'crypto' or meta.get('currentTradingPeriod', {}).get('regular', {}).get('start', 1e20) <= time.time() < meta.get('currentTradingPeriod', {}).get('regular', {}).get('end', 0))),
+                   stale=(dt.datetime.now(TZ).date()-dt.date.fromisoformat(history[-1]['date'])).days > (2 if kind == 'crypto' else 7))
+    except Exception as exc:
+        row.update(error=str(exc)[:180], price=None, history=[], returns=external_changes([], kind), stale=True)
+    return row
+
+
+def merge_external(previous, current):
+    prior = {r['symbol']: r for r in previous}
     output = []
-    for symbol, payload in re.findall(r'v_(\w+)="([^"]*)"', raw):
-        f = payload.split('~')
-        if len(f) < 35 or not f[3]:
+    for row in current:
+        old = prior.get(row['symbol'], {})
+        if row.get('error') and old:
+            output.append({**old, 'error': row['error'], 'retained': True})
             continue
-        stamp = f[30]
-        try:
-            price, previous = float(f[3]), float(f[4])
-            if price <= 0 or previous <= 0:
-                continue
-        except ValueError:
-            continue
-        source_day = stamp[:10].replace('/', '-')
-        try:
-            lag = (dt.datetime.now(TZ).date() - dt.date.fromisoformat(source_day)).days
-        except ValueError:
-            lag = 999
-        output.append({'symbol': symbol, 'name': f[1], 'price': price, 'change': (price / previous - 1) * 100,
-                       'timestamp': stamp, 'timezone': '香港时间' if symbol.startswith('hk') else '美东市场时间',
-                       'stale': lag > (1 if symbol.startswith('hk') else 4), 'source': '腾讯跨市场行情',
-                       'url': 'https://gu.qq.com/' + symbol})
+        if (old.get('ticker') == row.get('ticker') and len(old.get('history', [])) > len(row.get('history', []))
+                and row.get('history') and old['history'][-1]['date'] <= row['history'][-1]['date']):
+            values = {r['date']: r['close'] for r in old['history']}
+            values.update({r['date']: r['close'] for r in row['history']})
+            history = [{'date': d, 'close': c} for d, c in sorted(values.items())][-756:]
+            row = {**row, 'history': history, 'returns': external_changes(history, row['kind']),
+                   'retained_history': True, 'history_source': old.get('history_source', old.get('source')),
+                   'history_url': old.get('history_url', old.get('url'))}
+        output.append(row)
+    return output
+
+
+def load_external():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        return list(pool.map(load_global_asset, GLOBAL_ASSETS))
+
+
+GPR_URL = 'https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.dta'
+
+
+def parse_gpr_stata(raw):
+    """Bounded Stata 118 fixed-width reader; no optional scientific dependencies."""
+    def section(tag):
+        start = raw.find(b'<' + tag + b'>')
+        end = raw.find(b'</' + tag + b'>', start)
+        if start < 0 or end < 0:
+            raise ValueError('GPR文件缺少字段 ' + tag.decode())
+        return raw[start+len(tag)+2:end]
+    if section(b'release') != b'118' or section(b'byteorder') != b'LSF':
+        raise ValueError('GPR仅支持Stata118小端格式')
+    k, n = int.from_bytes(section(b'K'), 'little'), int.from_bytes(section(b'N'), 'little')
+    if not (1 <= k <= 100 and 1 <= n <= 100000):
+        raise ValueError('GPR行列数越界')
+    types = struct.unpack('<' + 'H'*k, section(b'variable_types'))
+    names = section(b'varnames')
+    if len(names) != 129*k:
+        raise ValueError('GPR变量名长度错误')
+    fields, offset = {}, 0
+    formats = {65526: ('d', 8), 65527: ('f', 4), 65528: ('i', 4), 65529: ('h', 2), 65530: ('b', 1)}
+    for i, t in enumerate(types):
+        name = names[i*129:(i+1)*129].split(b'\0')[0].decode('utf-8')
+        fmt, size = (None, t) if 1 <= t <= 2045 else formats.get(t, (None, 0))
+        if not size:
+            raise ValueError('GPR变量类型不支持')
+        fields[name] = (offset, fmt, size)
+        offset += size
+    required = ['DAY', 'GPRD', 'GPRD_ACT', 'GPRD_THREAT']
+    if not all(x in fields for x in required):
+        raise ValueError('GPR列名变更')
+    body = section(b'data')
+    if len(body) != offset*n:
+        raise ValueError('GPR记录长度错误')
+    rows = []
+    for i in range(max(0, n-1500), n):
+        row = {}
+        for name in required:
+            pos, fmt, size = fields[name]
+            block = body[i*offset+pos:i*offset+pos+size]
+            value = struct.unpack('<'+fmt, block)[0] if fmt else block.split(b'\0')[0].decode('utf-8')
+            row[name] = value if isinstance(value, str) or math.isfinite(value) and abs(value)<1e30 else None
+        day = dt.datetime.strptime(row['DAY'], '%Y%m%d').date().isoformat()
+        if day <= dt.datetime.now(TZ).date().isoformat():
+            rows.append({'date': day, **{name: row[name] for name in required[1:]}})
+    return rows
+
+
+def load_geopolitics():
+    rows = parse_gpr_stata(fetch(GPR_URL))
+    output = {'source': 'Caldara / Iacoviello GPR · 每周更新的日频新闻指数', 'url': 'https://www.matteoiacoviello.com/gpr.htm',
+              'provider_url': GPR_URL, 'fetched_at': now(), 'as_of': rows[-1]['date'], 'sample_count': len(rows), 'items': []}
+    for key, name, kind in [('GPRD_THREAT', '政治 / 地缘威胁代理', 'politics'), ('GPRD_ACT', '战争 / 冲突行动代理', 'war')]:
+        means = []
+        for i in range(29, len(rows)):
+            window = [r[key] for r in rows[i-29:i+1]]
+            if all(v is not None for v in window):
+                means.append((rows[i]['date'], sum(window)/30))
+        baseline = [v for d, v in means if d >= (dt.date.fromisoformat(rows[-1]['date'])-dt.timedelta(days=1095)).isoformat()]
+        latest = means[-1][1] if means and means[-1][0] == rows[-1]['date'] else None
+        percentile = sum(v <= latest for v in baseline)/len(baseline)*100 if latest is not None and len(baseline)>=252 else None
+        output['items'].append({'kind': kind, 'name': name, 'field': key, 'value30': latest, 'score': percentile,
+                                'baseline_count': len(baseline), 'weight': 10})
+    output['stale'] = (dt.datetime.now(TZ).date()-dt.date.fromisoformat(output['as_of'])).days > 14
     return output
 
 
@@ -498,7 +682,7 @@ class DataStore:
                 interim = {'schema_version': 4, 'data_kind': 'local', 'as_of': max(r['as_of'] for r in instruments.values()),
                            'closed_as_of': min(r.get('closed_as_of') or r['as_of'] for r in instruments.values()),
                            'previous_session': target, 'fetched_at': now(), 'instruments': instruments,
-                           'external': previous.get('external', []), 'sectors': previous.get('sectors', []), 'errors': errors}
+                           'external': previous.get('external', []), 'geopolitics': previous.get('geopolitics', {}), 'sectors': previous.get('sectors', []), 'errors': errors}
                 self.commit_snapshot(json.loads(json.dumps(interim)))
             with self.lock:
                 self.state['stage'] = '补充财务、公告与产业证据'
@@ -578,6 +762,12 @@ class DataStore:
             except Exception as exc:
                 external = previous.get('external', [])
                 errors['external'] = str(exc)[:180]
+            external = merge_external(previous.get('external', []), external)
+            try:
+                geopolitics = load_geopolitics()
+            except Exception as exc:
+                geopolitics = {**previous.get('geopolitics', {}), 'error': str(exc)[:180]}
+                errors['geopolitics'] = str(exc)[:180]
             sectors = []
             for a in SECTOR_ASSETS:
                 try:
@@ -589,7 +779,7 @@ class DataStore:
             snapshot = {'schema_version': 4, 'data_kind': 'local',
                         'as_of': max((r['as_of'] for r in instruments.values()), default=None),
                         'closed_as_of': min((r.get('closed_as_of') or r['as_of'] for r in instruments.values()), default=None),
-                        'fetched_at': now(), 'previous_session': target, 'external': external, 'sectors': sectors,
+                        'fetched_at': now(), 'previous_session': target, 'external': external, 'geopolitics': geopolitics, 'sectors': sectors,
                         'instruments': instruments, 'errors': errors}
             # Preserve the previous successful cache only if every request failed.
             if instruments:
@@ -641,7 +831,7 @@ class DataStore:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'RiskLensLocal/0.4.2'
+    server_version = 'RiskLensLocal/0.7.0'
 
     def log_message(self, format, *args):
         if self.path not in ['/api/status', '/api/snapshot']:
@@ -674,7 +864,8 @@ class Handler(BaseHTTPRequestHandler):
         name = 'index.html' if path == '/' else path.lstrip('/')
         if name not in ['index.html', 'styles.css', 'workbench.css', 'data.js', 'engine.js', 'app.js',
                         'views.js', 'research-views.js', 'strategy-views.js', 'local-connector.js', 'bootstrap.js',
-                        'lightweight-charts.js', 'lightweight-charts.LICENSE.txt', 'interactive-chart.js', 'evidence-views.js']:
+                        'lightweight-charts.js', 'lightweight-charts.LICENSE.txt', 'interactive-chart.js', 'evidence-views.js',
+                        'user-state.js', 'record-ui.js', 'themes.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css']:
             return self.send({'error': 'Not found'}, status=404)
         embedded = globals().get('EMBEDDED_ASSETS', {})
         if name in embedded:
