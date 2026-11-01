@@ -126,6 +126,7 @@ class CachePermissions(unittest.TestCase):
              patch.object(app, 'load_announcements', return_value=[]), \
              patch.object(app, 'load_flows', return_value=[]), \
              patch.object(app, 'load_external', return_value=[]), \
+             patch.object(app, 'load_geopolitics', return_value={}), \
              patch.object(app.tempfile, 'NamedTemporaryFile', side_effect=PermissionError(13, 'Permission denied')):
             store = app.DataStore(self.primary)
             store.refresh()
