@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ['index.html', 'styles.css', 'workbench.css', 'data.js', 'engine.js',
           'app.js', 'lightweight-charts.js', 'lightweight-charts.LICENSE.txt',
           'interactive-chart.js', 'evidence-views.js', 'views.js',
-          'local-connector.js', 'research-views.js', 'strategy-views.js', 'bootstrap.js']
+          'local-connector.js', 'research-views.js', 'strategy-views.js', 'record-ui.js', 'user-state.js', 'themes.css', 'risk.css', 'risk-engine.js', 'risk-views.js', 'market-cards.js', 'market-cards.css', 'bootstrap.js']
 
 
 def main():
