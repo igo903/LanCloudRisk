@@ -5,3 +5,4 @@ if(NAV.some(n=>n[0]===location.hash.slice(1)))state.page=location.hash.slice(1);
 if(hasLocalServer)mode='local';
 render();
 if(hasLocalServer)connectLocal();
+window.addEventListener('storage',event=>{if(event.key===RiskUserState.NOTES_KEY&&state.page==='review')render();if(event.key===RiskUserState.THEME_KEY)setWebsiteTheme(RiskUserState.getTheme(),false)});
