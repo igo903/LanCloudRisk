@@ -16,3 +16,5 @@ Credit: Dario Caldara and Matteo Iacoviello (2022), “Measuring Geopolitical Ri
 The source publishes its data under Creative Commons Attribution 4.0. The application derives 30-day rolling averages and historical percentile attention scores from GPRD_THREAT and GPRD_ACT; these transformations are not probabilities and are not endorsed by the authors. Data may be revised.
 
 Global market series are requested from Yahoo Finance, with Tencent (HSTECH) and Eastmoney (USDCNH and FTSE China A50/XIN9) historical fallbacks identified per row. Provider data rights remain with their respective owners. Gold/silver continuous futures and Treasury yields are explicitly distinguished from cash assets and investment returns.
+
+- 腾讯证券搜索用于核验A股、港股、美股证券名称及代码；Yahoo Finance图表/年度财务时间序列用于海外公开市场研究。数据以各提供方日期、价格及币种口径为准；免费公开接口可受限或中断。
