@@ -1,6 +1,7 @@
 'use strict';
 // Ordinal research model, v1.0. Weights and thresholds are assumptions, not calibrated probabilities.
 const RiskModel=(()=>{
+ const weights={DXY:6,CNH:5,US10Y:4,DJI:2,IXIC:8,N225:2,KOSPI:2,SOX:12,usSOXX:10,usQQQ:14,hkHSTECH:5,A50:3,GOLD:2,SILVER:1,BTC:4};
  const valid=x=>typeof x==='number'&&Number.isFinite(x),clip=x=>Math.max(0,Math.min(100,x));
  const mean=a=>a.reduce((s,x)=>s+x,0)/a.length;
  const day=()=>new Date(Date.now()+8*3600000).toISOString().slice(0,10);
@@ -33,12 +34,13 @@ const RiskModel=(()=>{
   return {...aggregate(parts),date:latest.date,ret20:r20,vol,drawdown:dd,reason:`${n}条日线 · ${latest.date}`};
  }
  function globalRisk(rows,geo,today=day()){
-  const expected=[['DXY',10],['CNH',8],['US10Y',7],['DJI',3],['IXIC',5],['N225',3],['KOSPI',3],['SOX',6],['usSOXX',6],['usQQQ',9],['hkHSTECH',6],['A50',4],['GOLD',3],['SILVER',2],['BTC',5]];
+  const expected=Object.entries(weights);
   const assets=expected.map(([symbol,weight])=>{const r=(rows||[]).find(x=>x.symbol===symbol)||{symbol,name:symbol,history:[]};const model=technical(r.history,r.kind,today);return {...r,weight,model}});
   const parts=assets.map(r=>({...r.model,name:r.name,weight:r.weight}));
   for(const kind of ['politics','war']){const item=(geo?.items||[]).find(x=>x.kind===kind);parts.push(leaf(kind==='politics'?'政治 / 地缘威胁':'战争 / 冲突行动',10,fresh(geo?.as_of,14,today)?item?.score:null,'GPR子项30日均值的近3年历史分位；非事件概率',geo?.as_of))}
   return {...aggregate(parts),assets};
  }
+ function regionalRisk(external,market){const symbols=market==='US'?['DJI','IXIC','SOX','usSOXX','usQQQ']:['hkHSTECH','A50','CNH'];return aggregate(external.assets.filter(r=>symbols.includes(r.symbol)).map(r=>({...r.model,name:r.name,weight:r.weight})));}
  function domesticRisk(instruments,codes,external,today=day()){
   const rows=codes.map(code=>({code,model:technical(instruments?.[code]?.bars,'equity',today)}));
   const local=aggregate(rows.map(r=>({...r.model,name:r.code,weight:1})));
@@ -62,6 +64,6 @@ const RiskModel=(()=>{
   const local=aggregate(parts),combined=aggregate([{...local,name:'个股 / ETF自身',weight:75},{...domestic,name:'A股风险传导',weight:25}]);
   return {...combined,local,code:asset.code,asset,price,parts:combined.parts};
  }
- return {aggregate,technical,globalRisk,domesticRisk,watchRisk,fresh,day,leaf};
+ return {aggregate,technical,globalRisk,domesticRisk,regionalRisk,watchRisk,fresh,day,leaf,weights};
 })();
 if(typeof module!=='undefined')module.exports=RiskModel;

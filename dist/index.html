@@ -7,7 +7,7 @@
   <meta name="description" content="观澜 A股市场、个股、情绪、估值与多因子研究工作台。含可导入数据快照的笑哭脸研究回测。">
   <title>观澜 · A股研究与风控工作台</title>
   <script src="user-state.js"></script>
-  <link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="workbench.css"><link rel="stylesheet" href="themes.css"><link rel="stylesheet" href="risk.css"><link rel="stylesheet" href="market-cards.css">
+  <link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="workbench.css"><link rel="stylesheet" href="themes.css"><link rel="stylesheet" href="risk.css"><link rel="stylesheet" href="market-cards.css"><link rel="stylesheet" href="watchlist-manager.css"><link rel="stylesheet" href="factor-screening.css">
 </head>
 <body>
   <aside id="sidebar" class="sidebar"></aside>
@@ -18,10 +18,10 @@
       <div class="top-tools"><label class="search-box"><span id="search-icon"></span><input id="global-search" placeholder="搜索股票 / 代码 / 行业" aria-label="搜索股票"></label><span id="data-status" class="demo-tag"><i></i>合成演示数据</span><button class="btn small" id="mode-toggle" onclick="switchMode()">切换快照模式</button><button class="btn small" id="local-refresh" hidden onclick="refreshLocalData()">刷新行情</button><label class="theme-select"><span>风格</span><select id="theme-select" aria-label="网站风格" onchange="setWebsiteTheme(this.value)"><option value="light">明亮</option><option value="polymarket">Polymarket 深色</option></select></label><span class="avatar">AL</span></div>
     </header>
     <main id="main" tabindex="-1"></main>
-    <footer>观澜 RISK LENS <span>研究工作台 v0.7.0 · 市场 / 自选 / 情绪 / 估值 / 因子 / 信号 · 数据模式与来源请以页内标注为准</span></footer>
+    <footer>观澜 RISK LENS <span>研究工作台 v0.9.0 · 市场 / 自选 / 情绪 / 估值 / 因子 / 信号 · 数据模式与来源请以页内标注为准</span></footer>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <dialog id="dialog"></dialog>
-  <script src="data.js"></script><script src="engine.js"></script><script src="lightweight-charts.js"></script><script src="interactive-chart.js"></script><script src="app.js"></script><script src="views.js"></script><script src="local-connector.js"></script><script src="research-views.js"></script><script src="strategy-views.js"></script><script src="record-ui.js"></script><script src="evidence-views.js"></script><script src="risk-engine.js"></script><script src="risk-views.js"></script><script src="market-cards.js"></script><script src="bootstrap.js"></script>
+  <script src="data.js"></script><script src="engine.js"></script><script src="lightweight-charts.js"></script><script src="interactive-chart.js"></script><script src="app.js"></script><script src="views.js"></script><script src="local-connector.js"></script><script src="research-views.js"></script><script src="strategy-views.js"></script><script src="record-ui.js"></script><script src="evidence-views.js"></script><script src="risk-engine.js"></script><script src="risk-views.js"></script><script src="market-cards.js"></script><script src="watchlist-manager.js"></script><script src="factor-screening.js"></script><script src="bootstrap.js"></script>
 </body>
 </html>
