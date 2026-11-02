@@ -25,7 +25,7 @@ test('metals score absolute shocks, not a universal equity bearish direction',()
 });
 test('all 15 expected assets remain in the denominator when providers fail',()=>{
  const rows=[{symbol:'usSOXX',kind:'equity',history:history()}],g=R.globalRisk(rows,{},today);
- near(g.coverage,.06);assert.equal(g.assets.length,15);near(g.low,g.score*.06);
+ near(g.coverage,.10);assert.equal(g.assets.length,15);near(g.low,g.score*.10);
 });
 test('GPR data exceeding 14 calendar days is excluded rather than scored as safe',()=>{
  const g=R.globalRisk([],{as_of:'2026-10-01',items:[{kind:'war',score:99},{kind:'politics',score:99}]},today);assert.equal(g.score,null);
@@ -42,8 +42,17 @@ test('good accounting results do not invent valuation or governance impact score
  const instrument={bars:history(),fundamentals:{period:'2026-09-30',notice_date:'2026-10-26',profit:1e8,revenueGrowth:30,cashRatio:1.5,debtRatio:30},announcements:[{title:'董事会公告'}]};
  const r=R.watchRisk(instrument,{code:'002281',type:'stock'},R.aggregate([]),today);assert.ok(r.local.parts[1].coverage===1);assert.equal(r.local.parts[2].score,null);assert.equal(r.local.parts[6].score,null);
 });
-test('SOX and SOXX are distinct risk leaves sharing the original 12 percent semiconductor budget',()=>{
+test('SOX and SOXX are distinct risk leaves sharing the increased 22 percent semiconductor budget',()=>{
  const g=R.globalRisk([{symbol:'SOX',kind:'equity',history:history()},{symbol:'usSOXX',kind:'equity',history:history()}],{},today);
- const semiconductor=g.assets.filter(x=>['SOX','usSOXX'].includes(x.symbol));assert.equal(semiconductor.length,2);assert.equal(semiconductor.reduce((s,x)=>s+x.weight,0),12);near(g.coverage,.12);
+ const semiconductor=g.assets.filter(x=>['SOX','usSOXX'].includes(x.symbol));assert.equal(semiconductor.length,2);assert.equal(semiconductor.reduce((s,x)=>s+x.weight,0),22);near(g.coverage,.22);
  assert.equal(g.parts.reduce((s,x)=>s+x.weight,0),100);
+});
+test('overseas equity weight is 50 percent and technology allocation is increased',()=>{
+ assert.equal(['DJI','IXIC','N225','KOSPI','SOX','usSOXX','usQQQ'].reduce((s,k)=>s+R.weights[k],0),50);
+ assert.equal(R.weights.usQQQ,14);assert.equal(R.weights.IXIC,8);
+ assert.equal(Object.values(R.weights).reduce((s,w)=>s+w,0),80);
+});
+test('US and HK watch risk parents use their own regional assets',()=>{
+ const g=R.globalRisk([{symbol:'usQQQ',kind:'equity',history:history()}],{},today);
+ assert.ok(R.regionalRisk(g,'US').coverage>0);assert.equal(R.regionalRisk(g,'HK').score,null);
 });

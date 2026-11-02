@@ -20,3 +20,21 @@ test('an intraday latest close updates the observation return without changing c
 test('flat returns are a valid zero rather than missing data',()=>{
  const m=E.metrics(bars(221).map(x=>({...x,close:100})));assert.equal(m.ret60,0);assert.equal(m.ret220,0);
 });
+test('5 day performance uses six observations and keeps zero and short history distinct',()=>{
+ near(E.metrics(bars(6)).ret5,5);assert.equal(E.metrics(bars(5)).ret5,null);
+ assert.equal(E.metrics(bars(6).map(b=>({...b,close:100}))).ret5,0);
+});
+test('cross-market snapshots validate declared identities before accepting price data',()=>{
+ const meta={code:'US.NVDA',symbol:'NVDA',name:'英伟达',market:'US',currency:'USD',type:'stock',watch:true};
+ const snap={catalog:[meta],instruments:{'US.NVDA':{source:'Yahoo',as_of:'2025-01-11',adjustment:'provider',bars:bars(6)}}};
+ assert.equal(E.validateSnapshot(snap).catalog[0].currency,'USD');
+ for(const bad of [{...meta,code:'NVDA'},{...meta,symbol:'https://evil'},{...meta,name:'<img>'}])assert.throws(()=>E.validateCatalog([bad]));
+ assert.throws(()=>E.validateCatalog([meta,meta]));
+});
+test('foreign backtests cannot be blocked by the A-share ETF gate',()=>{
+ vm.runInContext("CATALOG.push({code:'US.TEST',market:'US',type:'stock',name:'Test'})",context);
+ const record=E.demo.instruments['002281'],snap={instruments:{'US.TEST':record}},b=record.bars;
+ const p={start:b[0].date,end:b.at(-1).date,capital:1e6,position:50,fee:8,slip:5,lot:1,execution:'open',limit:3,enhanced:false};
+ const a=E.backtest(snap,'US.TEST',{...p,marketGate:false}),g=E.backtest(snap,'US.TEST',{...p,marketGate:true});
+ assert.ok(a.orders.length>0);assert.equal(JSON.stringify(a.orders),JSON.stringify(g.orders));
+});

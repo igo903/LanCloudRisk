@@ -82,7 +82,7 @@ class GlobalDataTests(unittest.TestCase):
         self.assertEqual(sox[2], '^SOX')
         self.assertEqual(sox[3], '点')
         self.assertEqual(soxx[2], 'SOXX')
-        self.assertEqual(sox[-1] + soxx[-1], 12)
+        self.assertEqual(sox[-1] + soxx[-1], 22)
 
     def test_wrong_ticker_identity_cannot_be_used(self):
         with patch.object(app, 'fetch', return_value=b'{"chart":{"result":[{"meta":{"symbol":"WRONG"}}]}}'):
