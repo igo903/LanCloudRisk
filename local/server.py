@@ -53,7 +53,7 @@ def fetch(url):
     host = urllib.parse.urlsplit(url).hostname or ''
     referer = 'https://fundf10.eastmoney.com/' if host.startswith(('fund', 'fundf10')) else 'https://quote.eastmoney.com/' if host.endswith('eastmoney.com') else 'https://finance.sina.com.cn/'
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 RiskLensLocal/0.7.0',
+        'User-Agent': 'Mozilla/5.0 RiskLensLocal/0.9.0',
         'Referer': referer,
     })
     with NETWORK_LIMIT:
@@ -177,6 +177,9 @@ def load_asset(asset, quotes, previous=None):
 
 def patch_quote(record, quote):
     """Apply the current cumulative OHLC only after history has been refreshed."""
+    stamp = dt.datetime.fromisoformat(quote['timestamp'])
+    if stamp.time() < dt.time(9, 30) and not all((quote.get(k) or 0) > 0 for k in ('open', 'high', 'low')):
+        raise ValueError('开盘前尚未形成有效日K，未采用竞价指示价')
     keys = ['open', 'high', 'low', 'price', 'volume']
     if not all(isinstance(quote.get(k), (int, float)) and math.isfinite(quote[k]) for k in keys):
         raise ValueError('最新报价缺少完整OHLC/累计量')
@@ -199,6 +202,15 @@ def patch_quote(record, quote):
     record['bars'] = [b for b in record['bars'] if b['date'] != live['date']] + [live]
     record.update(as_of=live['date'], completed=completed, latest_quote=quote, fetched_at=now(),
                   closed_as_of=max((b['date'] for b in record['bars'] if b.get('completed')), default=None))
+
+
+def retain_valid_history(record, reason):
+    last = record['bars'][-1]
+    record['live_error'] = str(reason)[:200]
+    record['latest_quote'] = {'code': record['latest_quote']['code'], 'name': record['latest_quote']['name'],
+                              'price': last['close'], 'date': last['date'], 'timestamp': last['date'],
+                              'source': '最新有效历史日线；实时补丁未采用', 'turnover': None}
+    record['closed_as_of'] = max((b['date'] for b in record['bars'] if b.get('completed')), default=None)
 
 
 def verify_previous(record, previous, target):
@@ -390,21 +402,21 @@ def load_nav(code):
 
 # The score model lives in the browser; this layer preserves dated source evidence.
 GLOBAL_ASSETS = [
-    ('DXY', '美元指数', 'DX-Y.NYB', '点', 'macro', 10),
-    ('CNH', '美元/离岸人民币', 'CNH=X', 'CNH/USD', 'macro', 8),
-    ('US10Y', '10年期美债收益率', '^TNX', '%', 'yield', 7),
-    ('DJI', '道琼斯工业指数', '^DJI', '点', 'equity', 3),
-    ('IXIC', '纳斯达克综合指数', '^IXIC', '点', 'equity', 5),
-    ('N225', '日经225指数', '^N225', '点', 'equity', 3),
-    ('KOSPI', '韩国综合指数', '^KS11', '点', 'equity', 3),
-    ('SOX', '费城半导体指数 · SOX', '^SOX', '点', 'equity', 6),
-    ('usSOXX', 'iShares半导体ETF · SOXX', 'SOXX', 'USD', 'equity', 6),
-    ('usQQQ', 'Invesco纳指100ETF · QQQ', 'QQQ', 'USD', 'equity', 9),
-    ('hkHSTECH', '恒生科技指数', 'HSTECH.HK', '点', 'equity', 6),
-    ('A50', '富时中国A50指数', 'XIN9.FGI', '点', 'equity', 4),
-    ('GOLD', '黄金 · COMEX连续期货代理', 'GC=F', 'USD/盎司', 'metal', 3),
-    ('SILVER', '白银 · COMEX连续期货代理', 'SI=F', 'USD/盎司', 'metal', 2),
-    ('BTC', '比特币 / 美元', 'BTC-USD', 'USD', 'crypto', 5),
+    ('DXY', '美元指数', 'DX-Y.NYB', '点', 'macro', 6),
+    ('CNH', '美元/离岸人民币', 'CNH=X', 'CNH/USD', 'macro', 5),
+    ('US10Y', '10年期美债收益率', '^TNX', '%', 'yield', 4),
+    ('DJI', '道琼斯工业指数', '^DJI', '点', 'equity', 2),
+    ('IXIC', '纳斯达克综合指数', '^IXIC', '点', 'equity', 8),
+    ('N225', '日经225指数', '^N225', '点', 'equity', 2),
+    ('KOSPI', '韩国综合指数', '^KS11', '点', 'equity', 2),
+    ('SOX', '费城半导体指数 · SOX', '^SOX', '点', 'equity', 12),
+    ('usSOXX', 'iShares半导体ETF · SOXX', 'SOXX', 'USD', 'equity', 10),
+    ('usQQQ', 'Invesco纳指100ETF · QQQ', 'QQQ', 'USD', 'equity', 14),
+    ('hkHSTECH', '恒生科技指数', 'HSTECH.HK', '点', 'equity', 5),
+    ('A50', '富时中国A50指数', 'XIN9.FGI', '点', 'equity', 3),
+    ('GOLD', '黄金 · COMEX连续期货代理', 'GC=F', 'USD/盎司', 'metal', 2),
+    ('SILVER', '白银 · COMEX连续期货代理', 'SI=F', 'USD/盎司', 'metal', 1),
+    ('BTC', '比特币 / 美元', 'BTC-USD', 'USD', 'crypto', 4),
     ('usNVDA', '英伟达', 'NVDA', 'USD', 'equity', 0),
     ('usMU', '美光科技', 'MU', 'USD', 'equity', 0),
     ('usTSM', '台积电ADR', 'TSM', 'USD', 'equity', 0),
@@ -426,7 +438,7 @@ def fetch_json_history(url):
 def external_changes(history, kind):
     """N intervals require N+1 valid dated observations; yields use bp, not returns."""
     out = {}
-    for n in (60, 250):
+    for n in (5, 20, 60, 250):
         if len(history) > n:
             a, b = history[-1]['close'], history[-n-1]['close']
             out[str(n)] = {'value': (a-b)*100 if kind == 'yield' else (a/b-1)*100,
@@ -441,7 +453,7 @@ def external_changes(history, kind):
 def load_global_asset(asset):
     symbol, name, ticker, unit, kind, weight = asset
     url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker, safe='') + '?range=2y&interval=1d'
-    row = {'symbol': symbol, 'name': name, 'ticker': ticker, 'unit': unit, 'kind': kind, 'weight': weight,
+    row = {'symbol': symbol, 'name': name, 'ticker': ticker, 'unit': unit, 'kind': kind, 'weight': RISK_WEIGHTS.get(symbol, weight),
            'url': 'https://finance.yahoo.com/quote/' + urllib.parse.quote(ticker, safe='') + '/',
            'source': 'Yahoo Finance 日频价格（非总回报）', 'provider_url': url, 'fetched_at': now()}
     try:
@@ -596,6 +608,327 @@ def load_geopolitics():
     return output
 
 
+# Market-qualified IDs prevent collisions such as HK.00700 versus US.00700.
+BASE_WATCH_CODES = {'002281', '601869', '688825', '688981', '300033', '300390', '515980', '588080'}
+BENCHMARK_CODES = {'510300', '159338', '510500', '512100', '159915', '588080'}
+RISK_WEIGHTS = {'DXY': 6, 'CNH': 5, 'US10Y': 4, 'DJI': 2, 'IXIC': 8, 'N225': 2, 'KOSPI': 2,
+                'SOX': 12, 'usSOXX': 10, 'usQQQ': 14, 'hkHSTECH': 5, 'A50': 3, 'GOLD': 2, 'SILVER': 1, 'BTC': 4}
+SEARCH_CACHE, SEARCH_LOCK = {}, threading.Lock()
+
+
+def base_catalog():
+    return {code: {'code': code, 'symbol': code, 'name': name, 'market': 'CN', 'currency': 'CNY',
+                   'type': 'etf' if code.startswith(('5', '15')) else 'stock', 'listed': listed,
+                   'watch': code in BASE_WATCH_CODES, 'benchmark': code in BENCHMARK_CODES,
+                   'provider_symbol': SYMBOLS[code]}
+            for code, name, listed in ASSETS}
+
+
+def asset_id(market, symbol):
+    market = str(market).upper()
+    symbol = str(symbol).strip().upper()
+    if market == 'CN' and re.fullmatch(r'\d{6}', symbol):
+        return symbol
+    if market == 'HK' and re.fullmatch(r'\d{1,5}(?:\.HK)?', symbol):
+        return 'HK.' + symbol.split('.')[0].zfill(5)
+    if market == 'US' and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', symbol):
+        return 'US.' + symbol
+    raise ValueError('市场或证券代码格式无效')
+
+
+def yahoo_symbol(meta):
+    if meta['market'] == 'HK':
+        return str(int(meta['symbol'])).zfill(4) + '.HK'
+    return meta['symbol']
+
+
+def parse_security_search(raw, market='ALL'):
+    match = re.search(r'v_hint\s*=\s*("(?:\\.|[^"\\])*")', raw.decode('gb18030'))
+    if not match:
+        raise ValueError('搜索源未返回证券列表')
+    text = json.loads(match.group(1))
+    rows, seen = [], set()
+    for entry in text.split('^'):
+        cells = entry.split('~')
+        if len(cells) < 5:
+            continue
+        exchange, raw_symbol, name, _, kind = cells[:5]
+        try:
+            if exchange in ('sh', 'sz', 'bj') and kind in ('GP-A', 'ETF', 'LOF'):
+                m, symbol = 'CN', raw_symbol
+            elif exchange == 'hk' and kind in ('GP', 'ETF'):
+                m, symbol = 'HK', raw_symbol.zfill(5)
+            elif exchange == 'us' and kind in ('GP', 'ETF'):
+                m = 'US'
+                symbol = re.sub(r'\.(?:oq|n|a|ps|o|p)$', '', raw_symbol, flags=re.I).replace('.', '-').upper()
+            else:
+                continue
+            code = asset_id(m, symbol)
+        except ValueError:
+            continue
+        if code in seen or market not in ('ALL', m):
+            continue
+        seen.add(code)
+        rows.append({'code': code, 'symbol': symbol, 'name': name[:100], 'market': m,
+                     'type': 'etf' if kind in ('ETF', 'LOF') else 'stock',
+                     'currency': {'CN': 'CNY', 'HK': 'HKD', 'US': 'USD'}[m],
+                     'provider_symbol': exchange + raw_symbol if m != 'US' else symbol,
+                     'search_source': '腾讯证券搜索', 'watch': False, 'benchmark': False})
+    return rows
+
+
+def search_securities(query, market='ALL'):
+    if market not in ('ALL', 'CN', 'HK', 'US'):
+        raise ValueError('不支持的市场')
+    query = str(query).strip()
+    if not 1 <= len(query) <= 50 or any(ord(c) < 32 for c in query):
+        raise ValueError('请输入1至50个字符的名称或证券代码')
+    key = (market, query.casefold())
+    with SEARCH_LOCK:
+        cached = SEARCH_CACHE.get(key)
+        if cached and time.monotonic() - cached[0] < 180:
+            return [dict(x) for x in cached[1]]
+    url = 'https://smartbox.gtimg.cn/s3/?' + urllib.parse.urlencode({'q': query, 't': 'all'})
+    rows = parse_security_search(fetch(url), market)
+    with SEARCH_LOCK:
+        if len(SEARCH_CACHE) > 200:
+            SEARCH_CACHE.clear()
+        SEARCH_CACHE[key] = (time.monotonic(), rows)
+    return rows
+
+
+def resolve_security(market, symbol):
+    market = str(market).upper()
+    code = asset_id(market, symbol)
+    search_symbol = code.split('.', 1)[1] if market != 'CN' else code
+    candidates = search_securities(search_symbol, market)
+    meta = next((r for r in candidates if r['code'] == code), None)
+    if not meta and market == 'US' and '-' in search_symbol:
+        meta = next((r for r in search_securities(search_symbol.replace('-', '.'), market) if r['code'] == code), None)
+    if not meta:
+        raise ValueError('证券搜索源未确认该标的；请从搜索结果添加')
+    meta = dict(meta)
+    if market == 'CN':
+        quote = parse_quotes(fetch(QUOTE + meta['provider_symbol'])).get(meta['provider_symbol'])
+        if not quote or quote['code'] != code or quote['name'] != meta['name']:
+            raise ValueError('证券名称与报价源核验不一致')
+    else:
+        symbol = yahoo_symbol(meta)
+        url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(symbol, safe='') + '?range=5d&interval=1d'
+        result = json_get(url)['chart']['result'][0]['meta']
+        if result.get('symbol', '').upper() != symbol.upper() or result.get('instrumentType') not in ('EQUITY', 'ETF'):
+            raise ValueError('海外行情源未确认股票/ETF身份')
+        if market == 'HK' and result.get('exchangeName') != 'HKG':
+            raise ValueError('港股交易所核验失败')
+        if market == 'US' and result.get('currency') != 'USD':
+            raise ValueError('当前美股模块仅接受美元交易的股票/ETF')
+        meta.update(currency=result.get('currency') or meta['currency'], provider_symbol=symbol,
+                    type='etf' if result['instrumentType'] == 'ETF' else 'stock',
+                    timezone=result.get('exchangeTimezoneName'), verified_name=result.get('longName') or result.get('shortName'))
+    meta.update(watch=True, verified_at=now(), benchmark=code in BENCHMARK_CODES if market == 'CN' else False)
+    return meta
+
+
+def market_timezone(meta):
+    name = meta.get('exchangeTimezoneName') or ('Asia/Hong_Kong' if str(meta.get('symbol', '')).endswith('.HK') else 'America/New_York')
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except (ImportError, KeyError):
+        return dt.timezone(dt.timedelta(seconds=meta.get('gmtoffset', 0)))
+
+
+def parse_international_chart(result, identity, current=None):
+    meta = result['meta']
+    ticker = yahoo_symbol(identity)
+    if meta.get('symbol', '').upper() != ticker.upper():
+        raise ValueError('海外历史数据标的身份不匹配')
+    zone = market_timezone(meta)
+    current = current or dt.datetime.now(dt.timezone.utc)
+    today = current.astimezone(zone).date().isoformat()
+    regular = meta.get('currentTradingPeriod', {}).get('regular', {})
+    regular_date = dt.datetime.fromtimestamp(regular['start'], zone).date().isoformat() if regular.get('start') else None
+    # HK close auction can finish after 16:00; use a conservative 10-minute buffer.
+    buffer = 600 if identity['market'] == 'HK' else 120
+    session_closed = bool(regular.get('end') and current.timestamp() >= regular['end'] + buffer)
+    quote = result['indicators']['quote'][0]
+    rows = {}
+    for i, stamp in enumerate(result.get('timestamp') or []):
+        day = dt.datetime.fromtimestamp(stamp, zone).date().isoformat()
+        if day > today:
+            continue
+        values = {key: (quote.get(key) or [])[i] if i < len(quote.get(key) or []) else None for key in ('open', 'high', 'low', 'close', 'volume')}
+        if not all(isinstance(x, (int, float)) and math.isfinite(x) for x in values.values()):
+            continue
+        if min(values[k] for k in ('open', 'high', 'low', 'close')) <= 0 or values['volume'] < 0:
+            continue
+        if values['low'] > min(values['open'], values['close']) or values['high'] < max(values['open'], values['close']):
+            continue
+        rows[day] = {'date': day, **{k: float(values[k]) for k in ('open', 'high', 'low', 'close')},
+                     'vol': float(values['volume']), 'netFlow': None,
+                     'completed': day < today or (day == regular_date and session_closed),
+                     'observed_at': now(), 'bar_source': 'Yahoo日频OHLC（不含盘前盘后）'}
+    bars = [r for _, r in sorted(rows.items())][-1000:]
+    if not bars:
+        raise ValueError('海外来源未返回经过校验的OHLC日线')
+    last = bars[-1]
+    stamp = meta.get('regularMarketTime')
+    return {'source': 'Yahoo Finance日线（供应商价格口径）', 'as_of': last['date'],
+            'closed_as_of': max((b['date'] for b in bars if b['completed']), default=None),
+            'adjustment': 'provider', 'completed': last['completed'], 'bars': bars, 'volume_unit': '股/份',
+            'market': identity['market'], 'currency': meta.get('currency') or identity['currency'],
+            'timezone': meta.get('exchangeTimezoneName'), 'fetched_at': now(), 'history_checked_at': now(),
+            'fundamentals': None, 'latest_quote': {'price': last['close'], 'code': identity['code'], 'name': identity['name'],
+                'timestamp': dt.datetime.fromtimestamp(stamp, zone).isoformat() if stamp else last['observed_at'],
+                'date': last['date'], 'source': 'Yahoo常规交易时段日线'},
+            'international_method': '本币日线研究；不换算人民币。不模拟盘前盘后、港股每手数量及完整税费。'}
+
+
+def load_international_asset(meta, previous=None):
+    ticker = yahoo_symbol(meta)
+    url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker, safe='') + '?range=5y&interval=1d&includePrePost=false'
+    result = json_get(url)['chart']['result'][0]
+    record = parse_international_chart(result, meta)
+    record['provider_url'] = url
+    prior_dates = [b['date'] for b in record['bars'] if b['completed']]
+    # Re-fetching all daily bars repairs the last previously-provisional trading session.
+    target = max((b['date'] for b in (previous or {}).get('bars', []) if b.get('completed') is False and any(x['date'] == b['date'] and x['completed'] for x in record['bars'])), default=None)
+    if not target:
+        target = prior_dates[-2] if record['completed'] and len(prior_dates)>1 else prior_dates[-1] if prior_dates else None
+    if target:
+        verify_previous(record, previous, target)
+    record['research_errors'] = {'flows': '该海外数据源未提供与A股可比的历史大单净额',
+                                 'announcements': '海外公告原文索引尚未接入，不把缺失视为无风险'}
+    for key in ('fundamentals', 'financial_history'):
+        if (previous or {}).get(key):
+            record[key] = previous[key]
+    record['research_fetched_at'] = now()
+    return meta['code'], record
+
+
+def load_watch_record(meta, previous=None, quotes=None):
+    if meta.get('market', 'CN') != 'CN':
+        return load_international_asset(meta, previous)
+    symbol = meta['provider_symbol']
+    SYMBOLS[meta['code']] = symbol
+    quotes = quotes if quotes is not None else parse_quotes(fetch(QUOTE + symbol))
+    code, record = load_asset((meta['code'], meta['name'], meta.get('listed')), quotes)
+    target = max((b['date'] for b in record['bars'] if b['date'] < quotes[symbol]['date']), default=None)
+    if target:
+        verify_previous(record, previous, target)
+    try:
+        patch_quote(record, parse_quotes(fetch(QUOTE + symbol))[symbol])
+    except Exception as exc:
+        # Bad or unavailable live OHLC must not erase independently validated daily history.
+        retain_valid_history(record, exc)
+    record.update(market='CN', currency='CNY')
+    return code, record
+
+
+def enrich_added_cn(meta, record):
+    issues = {}
+    operations = [('financials', lambda: load_financials(meta['code'], meta['name'], record['latest_quote'])),
+                  ('announcements', lambda: load_announcements(meta['code'])), ('flows', lambda: load_flows(meta['code']))]
+    if meta['type'] == 'etf':
+        operations = [('etf', lambda: load_holdings(meta['code'])), ('nav', lambda: load_nav(meta['code'])), ('announcements', lambda: load_announcements(meta['code']))]
+    for key, operation in operations:
+        try:
+            value = operation()
+            if key == 'financials':
+                record['fundamentals'], record['financial_history'] = value
+            else:
+                record[key] = value
+        except Exception as exc:
+            issues[key] = str(exc)[:180]
+    flows = {r['date']: r['netFlow'] for r in record.get('flows', [])}
+    for bar in record['bars']:
+        bar['netFlow'] = flows.get(bar['date'])
+    record.update(research_errors=issues, research_fetched_at=now())
+    return record
+
+
+def load_international_financials(meta):
+    # Annual statements only: never label annual figures as TTM or recent-quarter results.
+    fields = ['annualTotalRevenue', 'annualNetIncome', 'annualNetIncomeCommonStockholders',
+              'annualOperatingCashFlow', 'annualCapitalExpenditure', 'annualTotalAssets',
+              'annualTotalLiabilitiesNetMinorityInterest', 'annualGrossProfit']
+    url = 'https://query1.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/' + urllib.parse.quote(yahoo_symbol(meta), safe='') + '?' + urllib.parse.urlencode({
+        'type': ','.join(fields), 'period1': int(time.time()-5*366*86400), 'period2': int(time.time())})
+    result = json_get(url)['timeseries'].get('result') or []
+    values, currencies = {}, {}
+    for group in result:
+        for key in fields:
+            for row in group.get(key) or []:
+                date = row.get('asOfDate')
+                raw = row.get('reportedValue', {}).get('raw')
+                if (row.get('periodType') == '12M' and isinstance(date, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', date)
+                        and date <= dt.datetime.now(TZ).date().isoformat() and isinstance(raw, (int, float)) and math.isfinite(raw)):
+                    values.setdefault(date, {})[key] = float(raw)
+                    if row.get('currencyCode'):
+                        currencies.setdefault(date, set()).add(row['currencyCode'])
+    periods = sorted(d for d, v in values.items() if 'annualTotalRevenue' in v and ('annualNetIncome' in v or 'annualNetIncomeCommonStockholders' in v))
+    if not periods:
+        raise ValueError('来源未返回同一年度的营收和净利润；财务保持缺失')
+    period, current = periods[-1], values[periods[-1]]
+    if len(currencies.get(period, set())) != 1:
+        raise ValueError('年度财报币种缺失或不一致')
+    currency = next(iter(currencies[period]))
+    previous = next((d for d in reversed(periods[:-1]) if 320 <= (dt.date.fromisoformat(period)-dt.date.fromisoformat(d)).days <= 410 and currencies.get(d) == {currency}), None)
+    profit = lambda v: v.get('annualNetIncomeCommonStockholders', v.get('annualNetIncome'))
+    old = values.get(previous, {})
+    revenue, income, ocf = current.get('annualTotalRevenue'), profit(current), current.get('annualOperatingCashFlow')
+    f = {'period': period, 'period_basis': '年度累计，非TTM或最近季度', 'notice_date': None,
+         'currency': currency, 'revenue': revenue, 'profit': income, 'deductProfit': None,
+         'revenueGrowth': (revenue/old['annualTotalRevenue']-1)*100 if old.get('annualTotalRevenue', 0)>0 else None,
+         'profitGrowth': (income/profit(old)-1)*100 if profit(old) and profit(old)>0 else None,
+         'operatingCash': ocf, 'cashRatio': ocf/income if ocf is not None and income and income>0 else None,
+         'freeCashFlow': ocf-abs(current['annualCapitalExpenditure']) if ocf is not None and 'annualCapitalExpenditure' in current else None,
+         'debtRatio': current['annualTotalLiabilitiesNetMinorityInterest']/current['annualTotalAssets']*100 if current.get('annualTotalAssets', 0)>0 and 'annualTotalLiabilitiesNetMinorityInterest' in current else None,
+         'grossMargin': current['annualGrossProfit']/revenue*100 if revenue and 'annualGrossProfit' in current else None,
+         'source': 'Yahoo年度财务披露汇编 · ' + currency, 'source_url': url, 'cash_source_url': url,
+         'fetched_at': now(), 'publication_date_note': '未返回公告披露日；不将最新财务回填历史回测'}
+    history = [{'REPORT_DATE': d, 'TOTALOPERATEREVE': values[d].get('annualTotalRevenue'),
+                'PARENTNETPROFIT': profit(values[d]), 'NETCASH_OPERATE_PK': values[d].get('annualOperatingCashFlow'),
+                'currency': currency} for d in reversed(periods) if currencies.get(d) == {currency}]
+    return f, history
+
+
+def screening_member(holding):
+    code = holding.get('code', '')
+    if not isinstance(code, str) or not re.fullmatch(r'(?:00|30|60|68|43|83|87|92)\d{4}', code):
+        return None
+    symbol = ('sh' if code.startswith('6') else 'bj' if code.startswith(('4', '8', '92')) else 'sz') + code
+    return {'code': code, 'symbol': code, 'market': 'CN', 'currency': 'CNY', 'type': 'stock',
+            'name': str(holding.get('name') or code)[:100], 'provider_symbol': symbol, 'watch': False, 'benchmark': False}
+
+
+def load_screening_record(meta, previous=None):
+    meta = dict(meta)
+    if meta['market'] == 'CN':
+        quote = parse_quotes(fetch(QUOTE + meta['provider_symbol'])).get(meta['provider_symbol'])
+        if not quote or quote.get('code') != meta['code']:
+            raise ValueError('披露持股代码与报价身份不一致')
+        meta['name'] = quote['name']
+    _, record = load_watch_record(meta, previous)
+    if meta['market'] == 'CN':
+        try:
+            record['fundamentals'], record['financial_history'] = load_financials(meta['code'], meta['name'], record['latest_quote'])
+            f = record['fundamentals']
+            denominator = (f.get('floatShares') or f.get('shares')) if record.get('volume_unit') == '股/份' else None
+            turnovers = [100*b['vol']/denominator for b in record['bars'][-60:] if b.get('completed')] if denominator else []
+            f['turnover3m'] = sum(turnovers)/len(turnovers) if len(turnovers)>=40 else None
+        except Exception as exc:
+            record.setdefault('research_errors', {})['financials'] = str(exc)[:200]
+    else:
+        try:
+            record['fundamentals'], record['financial_history'] = load_international_financials(meta)
+        except Exception as exc:
+            record.setdefault('research_errors', {})['financials'] = str(exc)[:200]
+    if record.get('live_error'):
+        record.setdefault('research_errors', {})['live_quote'] = record['live_error'] + '；保留已校验历史日线'
+    return meta, record
+
+
 def cache_locations(requested):
     """Keep the existing cache, with writable per-user alternatives."""
     home = Path.home()
@@ -615,6 +948,14 @@ class DataStore:
         self.requested_cache = Path(cache).expanduser()
         self.cache = self.requested_cache
         self.lock = threading.Lock()
+        self.commit_lock = threading.RLock()
+        self.watch_operation_lock = threading.Lock()
+        self.asset_jobs, self.job_versions = {}, {}
+        self.screen_jobs, self.screening_cache = {}, {}
+        self.catalog = base_catalog()
+        self.watchlist_revision = 0
+        self.registry_activated = False
+        self.data_revision = 0
         self.state = {'busy': False, 'done': 0, 'total': len(ASSETS), 'stage': 'idle', 'errors': {}, 'last_refresh': None,
                       'cache_path': str(self.cache), 'cache_warning': None, 'cache_persisted': False}
         self.snapshot = {'data_kind': 'local', 'instruments': {}, 'as_of': None}
@@ -631,11 +972,236 @@ class DataStore:
         if self.cache != self.requested_cache:
             self.state['cache_warning'] = '已使用备用缓存目录：' + str(self.cache.parent)
 
+        cached_catalog = self.snapshot.get('catalog')
+        if isinstance(cached_catalog, list) and len(cached_catalog) <= 200:
+            for item in cached_catalog:
+                try:
+                    market = item['market']
+                    if asset_id(market, item['symbol']) != item['code'] or item.get('type') not in ('stock', 'etf'):
+                        continue
+                    safe = {k: item[k] for k in ['code', 'symbol', 'market', 'type', 'name', 'currency', 'provider_symbol', 'listed', 'timezone', 'verified_name', 'verified_at'] if k in item}
+                    if not isinstance(safe.get('name'), str) or len(safe['name']) > 100:
+                        continue
+                    if market == 'CN' and not re.fullmatch(r'(?:sh|sz|bj)\d{6}', safe.get('provider_symbol', '')):
+                        continue
+                    safe.update(watch=item.get('watch') is True, benchmark=item['code'] in BENCHMARK_CODES if market == 'CN' else False)
+                    self.catalog[item['code']] = safe
+                    if market == 'CN':
+                        SYMBOLS[item['code']] = safe['provider_symbol']
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self.watchlist_revision = max(0, int(self.snapshot.get('watchlist_revision') or 0))
+            self.registry_activated = True
+        self.data_revision = max(0, int(self.snapshot.get('data_revision') or 0))
+        cached = self.snapshot.get('screening_cache')
+        if isinstance(cached, dict):
+            self.screening_cache = {k:v for k,v in list(cached.items())[-200:] if isinstance(v, dict)}
+
+    def catalog_view(self):
+        return [dict(x) for x in self.catalog.values()]
+
+    def active_metadata(self):
+        with self.lock:
+            return [dict(m) for m in self.catalog.values() if m.get('watch') or m.get('benchmark')]
+
+    def check_revision(self, expected):
+        if type(expected) is not int or expected != self.watchlist_revision:
+            raise RuntimeError('自选列表已在其他页面更新，请同步后重试')
+
+    def save_registry(self):
+        with self.lock:
+            snapshot = json.loads(json.dumps(self.snapshot))
+            snapshot.update(catalog=self.catalog_view(), watchlist_revision=self.watchlist_revision, fetched_at=now())
+        self.commit_snapshot(snapshot)
+
+    def add_watch(self, market, symbol, expected_revision):
+        code = asset_id(market, symbol)
+        with self.watch_operation_lock:
+            with self.lock:
+                self.check_revision(expected_revision)
+                if self.catalog.get(code, {}).get('watch'):
+                    raise RuntimeError('该证券已在自选中')
+                if sum(bool(m.get('watch')) for m in self.catalog.values()) >= 50:
+                    raise ValueError('当前最多支持50只自选')
+            meta = resolve_security(market, symbol)
+            with self.lock:
+                self.catalog[code] = {**self.catalog.get(code, {}), **meta, 'watch': True}
+                self.watchlist_revision += 1
+                if market == 'CN':
+                    SYMBOLS[code] = meta['provider_symbol']
+            self.save_registry()
+            self.start_asset(code)
+        return meta
+
+    def remove_watch(self, code, expected_revision):
+        with self.watch_operation_lock:
+            with self.lock:
+                self.check_revision(expected_revision)
+                if code not in self.catalog or not self.catalog[code].get('watch'):
+                    raise ValueError('该证券不在自选中')
+                self.catalog[code]['watch'] = False
+                self.watchlist_revision += 1
+                self.job_versions[code] = secrets.token_hex(8)
+                self.asset_jobs.pop(code, None)
+            self.save_registry()
+
+    def start_asset(self, code):
+        with self.lock:
+            meta = self.catalog.get(code)
+            if not meta or not (meta.get('watch') or meta.get('benchmark')):
+                raise ValueError('该证券不在当前自选或观察池中')
+            if self.asset_jobs.get(code, {}).get('status') == 'loading':
+                return False
+            version = secrets.token_hex(8)
+            self.job_versions[code] = version
+            self.asset_jobs[code] = {'status': 'loading', 'stage': '重新获取日线', 'started_at': now()}
+        threading.Thread(target=self.refresh_asset, args=(code, version), daemon=True).start()
+        return True
+
+    def refresh_asset(self, code, version):
+        try:
+            with self.lock:
+                meta = dict(self.catalog[code])
+                previous = json.loads(json.dumps(self.snapshot.get('instruments', {}).get(code, {})))
+            _, record = load_watch_record(meta, previous)
+            with self.lock:
+                if self.job_versions.get(code) != version or not self.catalog[code].get('watch') and not self.catalog[code].get('benchmark'):
+                    return
+                snapshot = {**self.snapshot, 'instruments': {**self.snapshot.get('instruments', {}), code: record}, 'fetched_at': now(), 'catalog': self.catalog_view()}
+                self.asset_jobs[code]['stage'] = '补充研究数据'
+            self.commit_snapshot(snapshot)
+            if meta['market'] == 'CN':
+                record = enrich_added_cn(meta, record)
+            else:
+                try:
+                    record['fundamentals'], record['financial_history'] = load_international_financials(meta)
+                except Exception as exc:
+                    record.setdefault('research_errors', {})['financials'] = str(exc)[:200]
+            with self.lock:
+                if self.job_versions.get(code) != version or not self.catalog[code].get('watch') and not self.catalog[code].get('benchmark'):
+                    return
+                snapshot = {**self.snapshot, 'instruments': {**self.snapshot.get('instruments', {}), code: record}, 'fetched_at': now(), 'catalog': self.catalog_view()}
+            self.commit_snapshot(snapshot)
+            with self.lock:
+                if self.job_versions.get(code) == version:
+                    self.asset_jobs[code] = {'status': 'ready', 'stage': '完成', 'finished_at': now(), 'research_gaps': record.get('research_errors', {})}
+        except Exception as exc:
+            with self.lock:
+                if self.job_versions.get(code) == version:
+                    self.asset_jobs[code] = {'status': 'error', 'error': str(exc)[:300], 'finished_at': now()}
+
+    def start_screening(self, payload):
+        source, codes, market = payload.get('source'), payload.get('codes'), payload.get('market', 'CN')
+        if source not in ('watch', 'etf') or market not in ('CN', 'HK', 'US'):
+            raise ValueError('请选择股票池与市场')
+        if not isinstance(codes, list) or not 1 <= len(codes) <= (50 if source == 'watch' else 3) or any(not isinstance(c, str) for c in codes) or len(set(codes)) != len(codes):
+            raise ValueError('请选择1至50只股票，或1至3只自选ETF')
+        with self.lock:
+            if any(j.get('status') == 'loading' for j in self.screen_jobs.values()):
+                raise RuntimeError('已有筛选任务正在补充数据，请完成后重试')
+            selected = []
+            for code in codes:
+                meta = self.catalog.get(code)
+                if not meta or not meta.get('watch') or meta.get('type') != ('stock' if source == 'watch' else 'etf'):
+                    raise ValueError('仅可从当前自选股票或自选ETF中选择')
+                if meta['market'] != market or source == 'etf' and market != 'CN':
+                    raise ValueError('单次筛选限同一市场；ETF披露持股当前支持A股ETF')
+                selected.append(dict(meta))
+            job_id = secrets.token_hex(12)
+            # Bound in-memory results; an in-progress job is never evicted.
+            self.screen_jobs = dict(list(self.screen_jobs.items())[-2:])
+            self.screen_jobs[job_id] = {'status': 'loading', 'stage': '核验股票池', 'done': 0, 'total': 0, 'started_at': now()}
+        threading.Thread(target=self.prepare_screening, args=(job_id, source, selected, payload.get('refresh') is True), daemon=True).start()
+        return job_id
+
+    def prepare_screening(self, job_id, source, selected, refresh):
+        try:
+            with self.lock:
+                snapshot = json.loads(json.dumps(self.snapshot))
+                cache = json.loads(json.dumps(self.screening_cache))
+            members, origins, disclosures, issues = {}, {}, [], {}
+            if source == 'watch':
+                members = {m['code']: m for m in selected}
+            else:
+                for etf in selected:
+                    disclosure = snapshot.get('instruments', {}).get(etf['code'], {}).get('etf') or {}
+                    try:
+                        age = (dt.datetime.now(TZ).date() - dt.date.fromisoformat(disclosure.get('period', ''))).days
+                    except (ValueError, TypeError):
+                        age = 9999
+                    if refresh or not disclosure.get('holdings') or not 0 <= age <= 220:
+                        disclosure = load_holdings(etf['code'])
+                    if not disclosure.get('holdings'):
+                        raise ValueError(etf['name'] + '未返回披露持股，不能构建股票池')
+                    disclosures.append({'code': etf['code'], 'name': etf['name'], 'period': disclosure.get('period'),
+                                        'source': disclosure.get('source'), 'url': disclosure.get('url'), 'count': len(disclosure['holdings'])})
+                    for holding in disclosure['holdings']:
+                        meta = screening_member(holding)
+                        if not meta:
+                            issues[etf['code'] + ':' + str(holding.get('code'))] = '不属于当前可核验A股股票范围，已排除'
+                            continue
+                        members.setdefault(meta['code'], meta)
+                        origins.setdefault(meta['code'], []).append({'etf': etf['code'], 'name': etf['name'], 'weight': holding.get('weight'), 'period': disclosure.get('period')})
+            if not members or len(members) > 100:
+                raise ValueError('去重股票池为空或超过100只；请减少ETF数量')
+            records, errors = {}, {}
+            with self.lock:
+                self.screen_jobs[job_id].update(total=len(members), stage='补充行情与财务')
+            def prepare(meta):
+                code = meta['code']
+                old = snapshot.get('instruments', {}).get(code) or cache.get(code, {}).get('record') or {}
+                try:
+                    day = dt.date.fromisoformat(old.get('as_of', ''))
+                    fresh = 0 <= (dt.datetime.now(TZ).date() - day).days <= 7
+                except (ValueError, TypeError):
+                    fresh = False
+                if not refresh and fresh and old.get('bars') and old.get('fundamentals'):
+                    return meta, old, '复用带日期的公开快照'
+                try:
+                    verified, record = load_screening_record(meta, old)
+                    return verified, record, '本次重新获取'
+                except Exception as exc:
+                    if old.get('bars'):
+                        retained = json.loads(json.dumps(old))
+                        retained.setdefault('research_errors', {})['refresh'] = str(exc)[:200]
+                        return meta, retained, '本次更新失败，保留带日期的旧快照'
+                    raise
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(prepare, m): m['code'] for m in members.values()}
+                for future in concurrent.futures.as_completed(futures):
+                    code = futures[future]
+                    try:
+                        meta, record, origin = future.result()
+                        members[code], records[code] = meta, record
+                        members[code]['data_origin'] = origin
+                        if record.get('research_errors'):
+                            errors[code] = record['research_errors']
+                    except Exception as exc:
+                        errors[code] = {'provider': str(exc)[:250]}
+                    with self.lock:
+                        self.screen_jobs[job_id]['done'] += 1
+            # Screening records never join WATCH_CODES or the main risk/backtest universe.
+            with self.lock:
+                for code, record in records.items():
+                    self.screening_cache[code] = {'meta': members[code], 'record': record}
+                self.screening_cache = dict(list(self.screening_cache.items())[-200:])
+                saved = {**self.snapshot, 'screening_cache': self.screening_cache}
+            self.commit_snapshot(saved)
+            result = {'catalog': list(members.values()), 'instruments': records,
+                      'benchmark_instruments': {c:r for c,r in snapshot.get('instruments', {}).items() if c in BENCHMARK_CODES},
+                      'external': snapshot.get('external', []), 'origins': origins, 'disclosures': disclosures,
+                      'errors': errors, 'pool_issues': issues, 'source': source, 'fetched_at': now()}
+            with self.lock:
+                self.screen_jobs[job_id].update(status='ready', stage='数据准备完成', result=result, finished_at=now())
+        except Exception as exc:
+            with self.lock:
+                self.screen_jobs[job_id].update(status='error', error=str(exc)[:300], finished_at=now())
+
     def start(self):
         with self.lock:
             if self.state['busy']:
                 return False
-            self.state.update(busy=True, done=0, errors={}, started_at=now())
+            self.state.update(busy=True, done=0, total=sum(bool(m.get('watch') or m.get('benchmark')) for m in self.catalog.values()), errors={}, started_at=now())
         threading.Thread(target=self.refresh, daemon=True).start()
         return True
 
@@ -645,9 +1211,14 @@ class DataStore:
             with self.lock:
                 previous = json.loads(json.dumps(self.snapshot))
                 self.state['stage'] = '复核前一交易日收盘K线'
-            quotes = parse_quotes(fetch(QUOTE + ','.join(SYMBOLS.values())))
+            active = self.active_metadata()
+            cn_active = [m for m in active if m['market'] == 'CN']
+            cn_assets = [(m['code'], m['name'], m.get('listed')) for m in cn_active]
+            quote_symbols = [m['provider_symbol'] for m in cn_active] + [SYMBOLS[a[0]] for a in SECTOR_ASSETS]
+            quotes = parse_quotes(fetch(QUOTE + ','.join(quote_symbols)))
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(load_asset, a, quotes): a[0] for a in ASSETS}
+                futures = {pool.submit(load_asset, a, quotes): a[0] for a in cn_assets}
+                futures.update({pool.submit(load_international_asset, m, previous.get('instruments', {}).get(m['code'])): m['code'] for m in active if m['market'] != 'CN'})
                 for future in concurrent.futures.as_completed(futures):
                     code = futures[future]
                     try:
@@ -661,16 +1232,18 @@ class DataStore:
             reference_day = max((q['date'] for q in quotes.values()), default=dt.datetime.now(TZ).date().isoformat())
             target = max((b['date'] for b in (reference or {}).get('bars', []) if b['date'] < reference_day), default=None)
             for code, record in instruments.items():
-                if target:
+                if target and self.catalog[code]['market'] == 'CN':
                     verify_previous(record, previous.get('instruments', {}).get(code), target)
             with self.lock:
                 self.state['stage'] = '更新当天实时日K'
-            fresh_quotes = parse_quotes(fetch(QUOTE + ','.join(SYMBOLS.values())))
+            fresh_quotes = parse_quotes(fetch(QUOTE + ','.join(quote_symbols)))
             for code, record in instruments.items():
+                if self.catalog[code]['market'] != 'CN':
+                    continue
                 try:
                     patch_quote(record, fresh_quotes[SYMBOLS[code]])
                 except Exception as exc:
-                    record['live_error'] = str(exc)[:200]
+                    retain_valid_history(record, exc)
                     errors[code + ':live'] = str(exc)[:200]
                 old = previous.get('instruments', {}).get(code, {})
                 for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'research_errors', 'research_fetched_at']:
@@ -681,7 +1254,7 @@ class DataStore:
             if instruments:
                 interim = {'schema_version': 4, 'data_kind': 'local', 'as_of': max(r['as_of'] for r in instruments.values()),
                            'closed_as_of': min(r.get('closed_as_of') or r['as_of'] for r in instruments.values()),
-                           'previous_session': target, 'fetched_at': now(), 'instruments': instruments,
+                           'previous_session': target, 'fetched_at': now(), 'instruments': instruments, 'catalog': self.catalog_view(),
                            'external': previous.get('external', []), 'geopolitics': previous.get('geopolitics', {}), 'sectors': previous.get('sectors', []), 'errors': errors}
                 self.commit_snapshot(json.loads(json.dumps(interim)))
             with self.lock:
@@ -704,7 +1277,7 @@ class DataStore:
                             rec[key] = old[key]
                 else:
                     issues = {}
-                    if code.startswith(('5', '15')):
+                    if self.catalog.get(code, {}).get('type') == 'etf':
                         try:
                             rec['etf'] = load_holdings(code)
                         except Exception as exc:
@@ -734,7 +1307,7 @@ class DataStore:
                                         rec[old_key] = old[old_key]
                     rec['research_errors'] = issues
                     rec['research_fetched_at'] = now()
-                if not code.startswith(('5', '15')) and age < 21600:
+                if self.catalog.get(code, {}).get('type') != 'etf' and age < 21600:
                     try:
                         rec['flows'] = load_flows(code)
                     except Exception as exc:
@@ -755,8 +1328,14 @@ class DataStore:
                     f['turnover_basis'] = '成交股数/最近披露流通A股本' if f.get('floatShares') else '成交股数/最近披露总股本'
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-                for _ in pool.map(research, ASSETS):
+                for _ in pool.map(research, cn_assets):
                     pass
+            for meta in active:
+                if meta['market'] != 'CN' and meta['code'] in instruments:
+                    try:
+                        instruments[meta['code']]['fundamentals'], instruments[meta['code']]['financial_history'] = load_international_financials(meta)
+                    except Exception as exc:
+                        instruments[meta['code']].setdefault('research_errors', {})['financials'] = str(exc)[:180]
             try:
                 external = load_external()
             except Exception as exc:
@@ -780,7 +1359,7 @@ class DataStore:
                         'as_of': max((r['as_of'] for r in instruments.values()), default=None),
                         'closed_as_of': min((r.get('closed_as_of') or r['as_of'] for r in instruments.values()), default=None),
                         'fetched_at': now(), 'previous_session': target, 'external': external, 'geopolitics': geopolitics, 'sectors': sectors,
-                        'instruments': instruments, 'errors': errors}
+                        'instruments': instruments, 'catalog': self.catalog_view(), 'errors': errors}
             # Preserve the previous successful cache only if every request failed.
             if instruments:
                 self.commit_snapshot(snapshot)
@@ -791,47 +1370,62 @@ class DataStore:
                 self.state.update(busy=False, stage='完成', errors=errors, last_refresh=now())
 
     def commit_snapshot(self, snapshot):
-        # Fresh market data remains usable even when local persistence is unavailable.
-        with self.lock:
-            self.snapshot = snapshot
-        payload = json.dumps(snapshot, ensure_ascii=False)
-        candidates = list(dict.fromkeys([self.cache] + cache_locations(self.requested_cache)))
-        failure = None
-        for candidate in candidates:
-            temp = None
-            try:
-                candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                # A unique 0600 file avoids stale/root-owned market-cache.tmp files
-                # and collisions between two local processes. Replace atomically.
-                with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
-                                                 prefix='.market-cache-', suffix='.tmp',
-                                                 dir=candidate.parent, delete=False) as handle:
-                    temp = Path(handle.name)
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp, candidate)
-                self.cache = candidate
-                warning = ('已自动使用备用缓存目录：' + str(candidate.parent)
-                           if candidate != self.requested_cache else None)
-                with self.lock:
-                    self.state.update(cache_path=str(candidate), cache_warning=warning, cache_persisted=True)
-                return
-            except OSError as exc:
-                failure = exc
-            finally:
-                if temp is not None:
-                    try:
-                        temp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-        warning = '行情已更新，但缓存无法写入；当前数据保留在内存，重启后需重新获取。' + str(failure)
-        with self.lock:
-            self.state.update(cache_path=None, cache_warning=warning, cache_persisted=False)
+        with self.commit_lock:
+            # Fresh market data remains usable even when local persistence is unavailable.
+            with self.lock:
+                if self.registry_activated or 'catalog' in snapshot:
+                    self.registry_activated = True
+                    enabled = {m['code'] for m in self.catalog.values() if m.get('watch') or m.get('benchmark')}
+                    records = {c: r for c, r in self.snapshot.get('instruments', {}).items() if c in enabled}
+                    for code, record in snapshot.get('instruments', {}).items():
+                        if code not in enabled:
+                            continue
+                        old = records.get(code, {})
+                        if str(record.get('history_checked_at') or '') >= str(old.get('history_checked_at') or ''):
+                            records[code] = record
+                    self.data_revision += 1
+                    snapshot = {**snapshot, 'instruments': records, 'catalog': self.catalog_view(), 'watchlist_revision': self.watchlist_revision, 'data_revision': self.data_revision}
+                    snapshot['screening_cache'] = self.screening_cache
+                    snapshot['as_of'] = max((r.get('as_of') for r in records.values() if r.get('as_of')), default=None)
+                self.snapshot = snapshot
+            payload = json.dumps(snapshot, ensure_ascii=False)
+            candidates = list(dict.fromkeys([self.cache] + cache_locations(self.requested_cache)))
+            failure = None
+            for candidate in candidates:
+                temp = None
+                try:
+                    candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    # A unique 0600 file avoids stale/root-owned market-cache.tmp files
+                    # and collisions between two local processes. Replace atomically.
+                    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                                     prefix='.market-cache-', suffix='.tmp',
+                                                     dir=candidate.parent, delete=False) as handle:
+                        temp = Path(handle.name)
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp, candidate)
+                    self.cache = candidate
+                    warning = ('已自动使用备用缓存目录：' + str(candidate.parent)
+                               if candidate != self.requested_cache else None)
+                    with self.lock:
+                        self.state.update(cache_path=str(candidate), cache_warning=warning, cache_persisted=True)
+                    return
+                except OSError as exc:
+                    failure = exc
+                finally:
+                    if temp is not None:
+                        try:
+                            temp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            warning = '行情已更新，但缓存无法写入；当前数据保留在内存，重启后需重新获取。' + str(failure)
+            with self.lock:
+                self.state.update(cache_path=None, cache_warning=warning, cache_persisted=False)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'RiskLensLocal/0.7.0'
+    server_version = 'RiskLensLocal/0.9.0'
 
     def log_message(self, format, *args):
         if self.path not in ['/api/status', '/api/snapshot']:
@@ -849,23 +1443,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path == '/api/screening':
+            job_id = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('id', [''])[0]
+            with self.server.store.lock:
+                job = json.loads(json.dumps(self.server.store.screen_jobs.get(job_id)))
+            return self.send(job if job else {'error': '筛选任务不存在或已过期'}, status=200 if job else 404)
+        if path == '/api/search':
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                rows = search_securities(params.get('q', [''])[0], params.get('market', ['ALL'])[0])
+                return self.send({'results': rows, 'source': '腾讯证券搜索', 'fetched_at': now()})
+            except ValueError as exc:
+                return self.send({'error': str(exc)}, status=400)
+            except Exception as exc:
+                return self.send({'error': str(exc)[:250]}, status=502)
         if path == '/api/status':
             with self.server.store.lock:
-                result = {**self.server.store.state, 'coverage': len(self.server.store.snapshot['instruments']),
+                result = {**self.server.store.state, 'coverage': len(self.server.store.snapshot['instruments']), 'total': sum(bool(m.get('watch') or m.get('benchmark')) for m in self.server.store.catalog.values()),
                           'as_of': self.server.store.snapshot.get('as_of'),
                           'closed_as_of': self.server.store.snapshot.get('closed_as_of'),
-                          'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server'}
+                          'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server', 'data_revision': self.server.store.data_revision, 'watchlist_revision': self.server.store.watchlist_revision, 'asset_jobs': dict(self.server.store.asset_jobs)}
             return self.send(result)
         if path == '/api/snapshot':
             with self.server.store.lock:
-                result = self.server.store.snapshot
+                result = {**{k:v for k,v in self.server.store.snapshot.items() if k != 'screening_cache'}, 'catalog': self.server.store.catalog_view(), 'watchlist_revision': self.server.store.watchlist_revision, 'data_revision': self.server.store.data_revision}
+                result['external'] = [{**r, 'weight': RISK_WEIGHTS.get(r.get('symbol'), 0), 'returns': external_changes(r.get('history', []), r.get('kind'))} for r in result.get('external', [])]
             return self.send(result)
         # Deliberate static allowlist: never serve source, cache, credentials or .git.
         name = 'index.html' if path == '/' else path.lstrip('/')
         if name not in ['index.html', 'styles.css', 'workbench.css', 'data.js', 'engine.js', 'app.js',
                         'views.js', 'research-views.js', 'strategy-views.js', 'local-connector.js', 'bootstrap.js',
                         'lightweight-charts.js', 'lightweight-charts.LICENSE.txt', 'interactive-chart.js', 'evidence-views.js',
-                        'user-state.js', 'record-ui.js', 'themes.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css']:
+                        'user-state.js', 'record-ui.js', 'themes.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css']:
             return self.send({'error': 'Not found'}, status=404)
         embedded = globals().get('EMBEDDED_ASSETS', {})
         if name in embedded:
@@ -878,14 +1487,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send(text.encode(), kind + '; charset=utf-8')
 
     def do_POST(self):
-        if self.path != '/api/refresh':
+        if self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start'):
             return self.send({'error': 'Not found'}, status=404)
         origin = self.headers.get('Origin')
         host = self.headers.get('Host', '')
         if self.headers.get('X-RiskLens-Token') != TOKEN or (origin and urllib.parse.urlsplit(origin).netloc != host):
-            return self.send({'error': '仅允许当前页面发起刷新'}, status=403)
-        started = self.server.store.start()
-        self.send({'started': started}, status=202 if started else 200)
+            return self.send({'error': '仅允许当前页面发起操作'}, status=403)
+        if self.path == '/api/refresh':
+            started = self.server.store.start()
+            return self.send({'started': started}, status=202 if started else 200)
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if not 0 < length <= 4096:
+                raise ValueError('请求体长度无效')
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict):
+                raise ValueError('需要JSON对象')
+            store = self.server.store
+            if self.path == '/api/screening/start':
+                return self.send({'id': store.start_screening(payload)}, status=202)
+            if self.path == '/api/watchlist/add':
+                asset = store.add_watch(payload.get('market'), payload.get('symbol'), payload.get('expected_revision'))
+                return self.send({'asset': asset, 'revision': store.watchlist_revision, 'started': True}, status=202)
+            if self.path == '/api/watchlist/remove':
+                store.remove_watch(payload.get('code'), payload.get('expected_revision'))
+                return self.send({'removed': payload['code'], 'revision': store.watchlist_revision})
+            started = store.start_asset(payload.get('code'))
+            return self.send({'started': started}, status=202 if started else 200)
+        except RuntimeError as exc:
+            return self.send({'error': str(exc)}, status=409)
+        except (ValueError, TypeError, KeyError) as exc:
+            return self.send({'error': str(exc)}, status=400)
+        except Exception as exc:
+            return self.send({'error': str(exc)[:300]}, status=502)
 
 
 def main():
