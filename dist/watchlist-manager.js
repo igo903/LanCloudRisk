@@ -31,3 +31,46 @@ function managedWatchlist(){const stocks=WATCH_CODES.map(byCode).filter(Boolean)
 window.watchlist=managedWatchlist;window.filteredStocks=managedFilteredStocks;
 if(uploaded?.catalog)syncWatchCatalog(uploaded.catalog);
 document.getElementById('dialog').addEventListener('close',()=>{if(document.getElementById('dialog').dataset.kind==='watch-search'){watchSearch.controller?.abort();clearTimeout(watchSearch.timer);watchSearch.sequence++}});
+
+const WATCH_SORT_KEYS=new Set(['name','industry','price','change','ret5','ret20','ret60','ret220','trend','signal','samples','asOf']);
+function watchSortValue(a,key){
+ if(key==='name')return a.name||null;
+ if(key==='industry')return [a.industry,a.type==='etf'?'ETF':'股票'].filter(Boolean).join(' ');
+ const bars=series(a.code);
+ if(key==='samples')return bars.length;
+ if(key==='asOf')return obs(a.code)?.as_of||null;
+ if(key==='signal')return latestSignal(a.code)?.date||null;
+ const m=E.metrics(bars);
+ if(key==='trend')return ({'趋势偏弱':0,'趋势分歧':1,'趋势偏强':2})[trend(m).text]??null;
+ return m?.[key]??null;
+}
+function sortWatchRows(list,sort=state.watchSort,valueOf=watchSortValue){
+ if(!sort||!WATCH_SORT_KEYS.has(sort.key)||!['asc','desc'].includes(sort.direction))return list.slice();
+ const missing=v=>v===null||v===undefined||typeof v==='number'&&!Number.isFinite(v)||v==='';
+ const sign=sort.direction==='asc'?1:-1;
+ return list.map((asset,index)=>({asset,index,value:valueOf(asset,sort.key)})).sort((a,b)=>{
+  const am=missing(a.value),bm=missing(b.value);
+  if(am||bm)return am===bm?a.index-b.index:am?1:-1;
+  const order=typeof a.value==='number'&&typeof b.value==='number'?a.value-b.value:String(a.value).localeCompare(String(b.value),'zh-CN',{numeric:true,sensitivity:'base'});
+  return order*sign||a.index-b.index;
+ }).map(row=>row.asset);
+}
+function watchSortButton(key,label,hint=''){
+ const active=state.watchSort?.key===key,direction=active?state.watchSort.direction:null,next=direction==='asc'?'降序':'升序';
+ return `<button class="watch-sort-button ${active?'active':''}" data-watch-sort="${key}" onclick="toggleWatchSort('${key}')" aria-label="${esc(label)}，点击${next}排列" title="${esc(hint||label)}；点击${next}">${esc(label)}<span aria-hidden="true">${direction==='asc'?'↑':direction==='desc'?'↓':'↕'}</span></button>`;
+}
+function watchSortHeader(key,label,hint=''){
+ const active=state.watchSort?.key===key||key==='samples'&&state.watchSort?.key==='asOf';
+ const order=active?(state.watchSort.direction==='asc'?'ascending':'descending'):'none';
+ return `<th aria-sort="${order}">${key==='samples'?watchSortButton('samples','样本','按有效日线条数排序')+'<span class="watch-sort-separator">/</span>'+watchSortButton('asOf','数据时间','按行情日期排序'):watchSortButton(key,label,hint)}</th>`;
+}
+function toggleWatchSort(key){
+ if(!WATCH_SORT_KEYS.has(key))return;
+ state.watchSort={key,direction:state.watchSort?.key===key&&state.watchSort.direction==='asc'?'desc':'asc'};
+ const root=document.getElementById('watch-rows');
+ if(!root){render();return}
+ const scroll=root.querySelector('.table-wrap')?.scrollLeft||0;
+ root.innerHTML=watchTable(filteredStocks());
+ const wrap=root.querySelector('.table-wrap');if(wrap)wrap.scrollLeft=scroll;
+ root.querySelector(`[data-watch-sort="${key}"]`)?.focus({preventScroll:true});
+}
