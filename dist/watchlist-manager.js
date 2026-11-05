@@ -32,8 +32,9 @@ window.watchlist=managedWatchlist;window.filteredStocks=managedFilteredStocks;
 if(uploaded?.catalog)syncWatchCatalog(uploaded.catalog);
 document.getElementById('dialog').addEventListener('close',()=>{if(document.getElementById('dialog').dataset.kind==='watch-search'){watchSearch.controller?.abort();clearTimeout(watchSearch.timer);watchSearch.sequence++}});
 
-const WATCH_SORT_KEYS=new Set(['name','industry','price','change','ret5','ret20','ret60','ret220','trend','signal','samples','asOf']);
+const WATCH_SORT_KEYS=new Set(['name','industry','price','change','ret5','ret20','ret60','ret220','trend','signal','samples','asOf','flow1','flow3','flow5','flow10','flow20','flow60']);
 function watchSortValue(a,key){
+ if(['flow1','flow3','flow5','flow10','flow20','flow60'].includes(key))return watchFlowSnapshot(a).values[key];
  if(key==='name')return a.name||null;
  if(key==='industry')return [a.industry,a.type==='etf'?'ETF':'股票'].filter(Boolean).join(' ');
  const bars=series(a.code);

@@ -42,6 +42,7 @@ const RISK_TABLE_COLUMNS={
  watch:['name','market','risk','coverage','local','parent','ret20','date'],
  geopolitical:['name','weight','risk','value','date'],
  externalMarket:['name','price','change','ret60','ret250','date'],
+ flows:['date','flow1','netFlow','totalNetFlow','flow3','flow5','flow10','flow20'],
  researchPool:['name','ret20','revenue','profit','cash','ratio','period'],
  marketBench:['name','price','change','ret20','ret60','volatility','trend','date'],
  marketSector:['name','price','change','ret20','ret60','drawdown','trend','date']
@@ -81,7 +82,7 @@ function toggleRiskSort(table,key){
 }
 function riskDataTable(table,label,columns,rows,extraClass=''){
  const sorted=sortedRiskRows(rows,table);
- return `<div class="table-wrap risk-data-wrap" data-risk-table="${table}"><table class="risk-data-table ${extraClass}" aria-label="${esc(label)}"><thead><tr>${columns.map(([key,title,hint])=>riskTableHeader(table,key,title,hint)).join('')}</tr></thead><tbody>${sorted.map(row=>`<tr>${row.cells.map(cell=>`<td>${cell}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${columns.length}" class="empty">暂无可用标的，缺失数据不会补造。</td></tr>`}</tbody></table></div><p class="risk-sort-note">点击表头切换升序 / 降序；缺失值始终置后，同值保持原顺序。${table==='researchPool'?'经营现金按各自报告币种的原始金额排序，未换汇；报告期与累计/年度口径不同，请逐项核对。':table.startsWith('market')?'ETF为价格代理，不含分红再投资；盘中末根会随行情刷新变化。':'关注分覆盖不足60%不展示、不参与数值排名。价格按原单位数值排序，不换汇。外围变化列按展示数值排序，bp与%不可视作同口径收益排名。'}</p>`;
+ return `<div class="table-wrap risk-data-wrap" data-risk-table="${table}"><table class="risk-data-table ${extraClass}" aria-label="${esc(label)}"><thead><tr>${columns.map(([key,title,hint])=>riskTableHeader(table,key,title,hint)).join('')}</tr></thead><tbody>${sorted.map(row=>`<tr>${row.cells.map(cell=>`<td>${cell}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${columns.length}" class="empty">暂无可用标的，缺失数据不会补造。</td></tr>`}</tbody></table></div><p class="risk-sort-note">点击表头切换升序 / 降序；缺失值始终置后，同值保持原顺序。${table==='flows'?'默认展示最近10个资金记录日期；当日净流入与原超大单+大单净额列同口径。累计净流入为超大单+大单净额，截至各行日期并包含当日。近N日按N条去重后的日频记录计算；不足N条或窗口内缺失显示—，零值正常计入。节假日不插值；来源未返回的日期无法据此确认。金额按标的原币种展示，不代表机构身份或ETF净申购。':table==='researchPool'?'经营现金按各自报告币种的原始金额排序，未换汇；报告期与累计/年度口径不同，请逐项核对。':table.startsWith('market')?'ETF为价格代理，不含分红再投资；盘中末根会随行情刷新变化。':'关注分覆盖不足60%不展示、不参与数值排名。价格按原单位数值排序，不换汇。外围变化列按展示数值排序，bp与%不可视作同口径收益排名。'}</p>`;
 }
 function riskReturnCell(x,n){const r=x.returns?.[String(n)];return `<span class="num ${cls(r?.value)}">${E.valid(r?.value)?(r.value>0?'+':'')+num(r.value)+(r.unit==='bp'?' bp':'%'):'—'}</span>`}
 function riskDateCell(x){return `${esc(x.history_as_of||x.timestamp||'未返回')}<small class="table-sub">${esc(x.timezone||'日频')}${x.provisional?' · 盘中快照':''}</small>${x.url?sourceLink(x.url,'来源'):''}`}
@@ -99,8 +100,8 @@ function riskGeopoliticalDisplay(geo){
 }
 function riskDomesticDisplay(riskRows){
  if(riskLayout('domestic')==='cards')return benchmarkCards(null,riskRows);
- const rows=riskRows.map(x=>{const a=byCode(x.code),bars=series(x.code),m=E.metrics(bars),date=bars.at(-1)?.date;return {values:{name:a.shortName||a.name,price:m?.price,change:m?.change,ret20:m?.ret20,ret60:m?.ret60,volatility:m?.vol20,risk:visibleRiskValue(x.model),coverage:x.model.coverage,date},cells:[`<button class="stock-link" onclick="openBenchmark('${x.code}')">${esc(a.shortName||a.name)}</button><small class="table-sub">${x.code} · 本地权重1/6</small>`,num(m?.price,3),`<span class="${cls(m?.change)}">${change(m?.change)}</span>`,`<span class="${cls(m?.ret20)}">${change(m?.ret20)}</span>`,`<span class="${cls(m?.ret60)}">${change(m?.ret60)}</span>`,change(m?.vol20),riskBadge(x.model),num(x.model.coverage*100,0)+'%',esc(date||'未返回')+(bars.at(-1)?.completed===false?' · 盘中':''),`<details class="risk-row-details"><summary>评分依据</summary>${riskPartsTable(x.model.parts)}</details>${button('查看K线',`setAsset('${x.code}','backtest')`)} `]}});
- return riskDataTable('domestic','A股指数风险表',[['name','六类ETF'],['price','价格（元）'],['change','日涨跌'],['ret20','20日涨跌'],['ret60','60日涨跌'],['volatility','20日年化波动'],['risk','本地关注分'],['coverage','有效覆盖'],['date','数据日期'],[null,'依据 / 研究']],rows);
+ const rows=riskRows.map(x=>{const a=byCode(x.code),bars=series(x.code),m=E.metrics(bars),date=bars.at(-1)?.date;return {values:{name:a.shortName||a.name,price:m?.price,change:m?.change,ret20:m?.ret20,ret60:m?.ret60,volatility:m?.vol20,risk:visibleRiskValue(x.model),coverage:x.model.coverage,date},cells:[`<a class="risk-watch-asset risk-benchmark-asset" href="${esc(backtestHref(x.code))}" aria-label="${esc(a.shortName||a.name)} · 打开回测"><strong>${esc(a.shortName||a.name)}</strong><small class="table-sub">${x.code} · 本地权重1/6</small></a>`,num(m?.price,3),`<span class="${cls(m?.change)}">${change(m?.change)}</span>`,`<span class="${cls(m?.ret20)}">${change(m?.ret20)}</span>`,`<span class="${cls(m?.ret60)}">${change(m?.ret60)}</span>`,change(m?.vol20),riskBadge(x.model),num(x.model.coverage*100,0)+'%',esc(date||'未返回')+(bars.at(-1)?.completed===false?' · 盘中':''),`<button class="risk-detail-link" aria-haspopup="dialog" onclick="openDomesticRiskDetails('${x.code}')">评分依据</button>`]}});
+ return riskDataTable('domestic','A股指数风险表',[['name','六类ETF'],['price','价格（元）'],['change','日涨跌'],['ret20','20日涨跌'],['ret60','60日涨跌'],['volatility','20日年化波动'],['risk','本地关注分'],['coverage','有效覆盖'],['date','数据日期'],[null,'评分依据']],rows);
 }
 function riskWatchDisplay(watch){
  if(riskLayout('watch')==='cards')return riskWatchCards(watch);
@@ -125,5 +126,14 @@ function openExternalRiskDetails(symbol){
  const dialog=document.getElementById('dialog');if(dialog.open)dialog.close();
  dialog.dataset.kind='risk-details';dialog.setAttribute('aria-label',x.name+' · 解读与评分依据');
  dialog.innerHTML=`<div class="dialog-head"><div><h2>${esc(x.name)} · 解读与评分依据</h2><p>${esc(x.ticker||x.symbol)} · 权重 ${num(x.weight,0)}% · ${esc(x.history_as_of||'日期缺失')}</p></div><button class="icon-button" autofocus aria-label="关闭解读与评分依据弹窗" onclick="document.getElementById('dialog').close()">${icon('close')}</button></div><div class="dialog-body risk-dialog-body"><div class="risk-dialog-summary"><span>资产关注分</span>${riskBadge(x.model)}</div>${riskCoverage(x.model)}<div class="risk-dialog-reading">${externalRead(x)}</div><h3>评分分项与缺失依据</h3>${riskPartsTable(x.model.parts)}<p class="risk-description">有效覆盖不足60%时隐藏点分。评分为研究关注程度，不是亏损概率；各市场日频日期不同，盘中数据会变化。</p><div class="provenance">${riskDateCell(x)}${x.history_url?' · '+sourceLink(x.history_url,'历史日线来源'):''}${x.symbol==='SOX'?' · '+sourceLink('https://indexes.nasdaq.com/Index/Overview/sox','Nasdaq指数说明'):x.symbol==='usSOXX'?' · '+sourceLink('https://www.ishares.com/us/products/239705/fund','iShares基金说明'):''}</div></div><div class="risk-dialog-actions"><button class="btn" onclick="document.getElementById('dialog').close()">关闭</button></div>`;
+ dialog.showModal();
+}
+
+function openDomesticRiskDetails(code){
+ if(!BENCH_CODES.includes(code))return;
+ const x=riskSnapshot().dom.rows.find(item=>item.code===code);if(!x)return;
+ const a=byCode(code),bars=series(code),last=bars.at(-1),dialog=document.getElementById('dialog');if(dialog.open)dialog.close();
+ dialog.dataset.kind='risk-details';dialog.setAttribute('aria-label',(a.shortName||a.name)+' · 评分依据');
+ dialog.innerHTML=`<div class="dialog-head"><div><h2>${esc(a.shortName||a.name)} · 评分依据</h2><p>${esc(code)} · ${esc(a.manager||'ETF代理')} · ${esc(last?.date||'日期缺失')}${last?.completed===false?' · 盘中未确认':''}</p></div><button class="icon-button" autofocus aria-label="关闭ETF评分依据弹窗" onclick="document.getElementById('dialog').close()">${icon('close')}</button></div><div class="dialog-body risk-dialog-body"><div class="risk-dialog-summary"><span>ETF本地关注分</span>${riskBadge(x.model)}</div>${riskCoverage(x.model)}<p class="risk-description">该ETF在六类ETF本地模型中等权占1/6。A股指数风险在本地综合分基础上叠加外围风险（本地70% + 外围30%）；本弹窗展示该ETF自身的技术评分依据。</p><h3>评分分项与缺失依据</h3>${riskPartsTable(x.model.parts)}<p class="risk-description">分数为研究关注程度，不是亏损概率。有效覆盖不足60%时隐藏点分；ETF采用价格代理，未计分红再投资，盘中末根随刷新变化。</p><div class="provenance">${sourceLine(code)}</div></div><div class="risk-dialog-actions"><button class="btn" onclick="document.getElementById('dialog').close()">关闭</button></div>`;
  dialog.showModal();
 }
