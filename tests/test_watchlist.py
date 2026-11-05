@@ -67,6 +67,32 @@ class WatchlistTests(unittest.TestCase):
             store.commit_snapshot({'catalog':store.catalog_view(),'instruments':{'US.NVDA':{'as_of':'2026-10-30','history_checked_at':'2026-11-02T10:00:00','bars':[1]}}})
             store.commit_snapshot({'catalog':store.catalog_view(),'instruments':{'002281':{'as_of':'2026-10-30'},'US.NVDA':{'as_of':'2026-10-29','history_checked_at':'2026-11-01T10:00:00'}}})
             self.assertEqual(store.snapshot['instruments']['US.NVDA']['bars'],[1])
+    def test_single_stock_refresh_retains_funds_when_provider_returns_empty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store=self.store(Path(folder)/'cache.json')
+            flows=[{'date':'2026-10-30','netFlow':120000000}]
+            store.commit_snapshot({'catalog':store.catalog_view(),'instruments':{'002281':{'as_of':'2026-10-30','flows':flows}}})
+            version='refresh-flow-test';store.job_versions['002281']=version;store.asset_jobs['002281']={'status':'loading'}
+            fresh={'as_of':'2026-11-02','bars':[{'date':'2026-10-30'},{'date':'2026-11-02'}],'latest_quote':{'price':10}}
+            with patch.object(app,'load_watch_record',return_value=('002281',fresh)), \
+                 patch.object(app,'load_financials',return_value=({},[])), patch.object(app,'load_announcements',return_value=[]), \
+                 patch.object(app,'json_get',return_value=[]), patch.object(store,'commit_snapshot',wraps=store.commit_snapshot) as publish:
+                store.refresh_asset('002281',version)
+            self.assertEqual(publish.call_count,2)
+            for call in publish.call_args_list:
+                self.assertEqual(call.args[0]['instruments']['002281']['flows'],flows)
+            result=store.snapshot['instruments']['002281']
+            self.assertEqual(result['as_of'],'2026-11-02')
+            self.assertEqual(result['bars'][0]['netFlow'],120000000)
+            self.assertIsNone(result['bars'][1]['netFlow'])
+            self.assertIn('flows',result['research_errors'])
+
+    def test_flow_provider_zero_is_valid_and_missing_amounts_are_not(self):
+        for rows in ([],[{'opendate':'2026-10-30','netamount':'10'}]):
+            with patch.object(app,'json_get',return_value=rows),self.assertRaises(ValueError):
+                app.load_flows('002281')
+        with patch.object(app,'json_get',return_value=[{'opendate':'2026-10-30','r0_net':'-10','r1_net':'10'}]):
+            self.assertEqual(app.load_flows('002281')[0]['netFlow'],0)
     def test_external_short_windows_and_weight_budget(self):
         rows=[{'date':str(i),'close':100+i} for i in range(21)]
         r=app.external_changes(rows,'equity');self.assertAlmostEqual(r['5']['value'],(120/115-1)*100);self.assertAlmostEqual(r['20']['value'],20)

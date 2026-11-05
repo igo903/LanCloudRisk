@@ -27,3 +27,11 @@ test('header toggles ascending and descending with accessible direction and keyb
  vm.runInContext("toggleWatchSort('name')",context);assert.equal(vm.runInContext('state.watchSort.direction',context),'asc');
  vm.runInContext("toggleWatchSort('asOf')",context);html=vm.runInContext("watchSortHeader('samples','样本 / 数据时间')",context);assert.match(html,/aria-sort="ascending"/);assert.match(html,/data-watch-sort="asOf"/);
 });
+
+test('all six watch fund columns sort numeric amounts, retain zero and keep missing last',()=>{
+ context.watchFlowSnapshot=a=>({values:{flow1:a.value,flow3:a.value,flow5:a.value,flow10:a.value,flow20:a.value,flow60:a.value}});
+ const rows=[{id:'missing',value:null},{id:'in',value:1e8},{id:'out',value:-3e8},{id:'zero',value:0}];
+ const valueOf=vm.runInContext('watchSortValue',context);for(const key of ['flow1','flow3','flow5','flow10','flow20','flow60']){
+ assert.deepEqual(codes(sort(rows,{key,direction:'asc'},valueOf)),['out','zero','in','missing']);assert.deepEqual(codes(sort(rows,{key,direction:'desc'},valueOf)),['in','zero','out','missing']);
+ }
+});

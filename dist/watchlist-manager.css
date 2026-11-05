@@ -23,3 +23,19 @@ dialog[data-kind="watch-remove"]{width:460px}
 .watch-dialog-body input:focus-visible,.watch-dialog-body select:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 
 .watch-sort-button{display:inline-flex;align-items:center;gap:5px;padding:3px 0;color:inherit;font:inherit;white-space:nowrap;text-align:left}.watch-sort-button>span{font-size:11px;color:var(--muted);min-width:10px}.watch-sort-button:hover,.watch-sort-button.active,.watch-sort-button.active>span{color:var(--teal)}.watch-sort-button.active{font-weight:650}.watch-sort-button:focus-visible{outline:2px solid var(--teal);outline-offset:3px;border-radius:3px}.watch-sort-separator{margin:0 3px;color:var(--muted)}
+
+.watch-table{min-width:2180px}.watch-study-link{display:inline-flex;align-items:center;gap:5px;padding:6px 8px;border-radius:6px;color:var(--teal);font-size:11px;line-height:1.7;text-decoration:none;white-space:nowrap}.watch-study-link svg{width:12px;height:12px;flex:none}.watch-study-link:hover,.watch-study-link:focus-visible{background:var(--teal-soft);color:var(--teal)}.watch-study-link:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+@media(max-width:720px){.watch-table{min-width:2100px}}
+
+.watch-table-wrap{scroll-padding-inline:200px 300px}@media(max-width:720px){.watch-table-wrap{scroll-padding-inline:12px}}
+@media(max-width:720px){.watch-table th:last-child,.watch-table td:last-child{position:static;box-shadow:none}}
+
+.watch-table th.watch-research-column,.watch-table td.watch-research-column{width:180px;min-width:180px}
+.watch-research-links{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:2px 6px;min-width:146px}.watch-research-links .watch-study-link{padding:5px 6px;justify-content:flex-start}
+
+.watch-table .stock-link{display:flex;flex-direction:column;align-items:flex-start;gap:3px;text-align:left}.watch-table .stock-name,.watch-table .stock-code{display:block}.watch-table .stock-code{margin-left:0}.watch-flow-cell{min-width:130px;white-space:nowrap}
+
+dialog[data-kind="etf-flow"]{width:860px;max-width:calc(100vw - 32px)}
+.etf-flow-detail{max-height:54vh;overflow:auto;margin:12px 0}
+.etf-flow-detail table{min-width:630px}
+.watch-flow-cell .text-button{margin-top:4px;white-space:nowrap}

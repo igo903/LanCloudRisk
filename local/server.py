@@ -51,7 +51,7 @@ def now():
 
 def fetch(url):
     host = urllib.parse.urlsplit(url).hostname or ''
-    referer = 'https://fundf10.eastmoney.com/' if host.startswith(('fund', 'fundf10')) else 'https://quote.eastmoney.com/' if host.endswith('eastmoney.com') else 'https://finance.sina.com.cn/'
+    referer = 'https://www.sse.com.cn/' if host == 'query.sse.com.cn' else 'https://fundf10.eastmoney.com/' if host.startswith(('fund', 'fundf10')) else 'https://quote.eastmoney.com/' if host.endswith('eastmoney.com') else 'https://finance.sina.com.cn/'
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 RiskLensLocal/0.9.0',
         'Referer': referer,
@@ -361,6 +361,8 @@ def load_flows(code):
         jumbo, large = number(r.get('r0_net')), number(r.get('r1_net'))
         output.append({'date': r['opendate'][:10], 'netFlow': jumbo + large if jumbo is not None and large is not None else None,
                        'totalNetFlow': number(r.get('netamount')), 'source': '新浪超大单+大单净额（交易分类，非机构身份）'})
+    if not any(row['netFlow'] is not None and math.isfinite(row['netFlow']) for row in output):
+        raise ValueError('新浪未返回有效的大单资金净额，保留已有资金历史')
     return output
 
 
@@ -386,18 +388,100 @@ def load_holdings(code):
             'source': '基金季报（天天基金汇编）', 'url': url, 'fetched_at': now()}
 
 
-def load_nav(code):
+def load_nav_history(code):
     url = 'https://fund.eastmoney.com/pingzhongdata/' + code + '.js?v=' + dt.datetime.now(TZ).strftime('%Y%m%d')
     text = fetch(url).decode('utf-8')
     match = re.search(r'var\s+Data_netWorthTrend\s*=\s*(\[.*?\]);', text, re.S)
     if not match:
         raise ValueError('基金净值数组不可用')
-    rows = json.loads(match.group(1))
+    rows = {dt.datetime.fromtimestamp(r['x'] / 1000, TZ).date().isoformat(): number(r['y'])
+            for r in json.loads(match.group(1)) if (number(r.get('y')) or 0) > 0}
     if not rows:
         raise ValueError('基金净值为空')
-    latest = rows[-1]
-    return {'date': dt.datetime.fromtimestamp(latest['x'] / 1000, TZ).date().isoformat(),
-            'value': latest['y'], 'source': '天天基金历史单位净值', 'url': url, 'fetched_at': now()}
+    return rows, url
+
+
+def load_nav(code):
+    rows, url = load_nav_history(code)
+    latest = max(rows)
+    return {'date': latest, 'value': rows[latest], 'source': '天天基金历史单位净值', 'url': url, 'fetched_at': now()}
+
+
+ETF_FLOW_SOURCE = '上交所清算后ETF份额变化 × 天天基金前一交易日单位净值（估算）'
+ETF_FLOW_LIMIT = 60
+
+
+def load_sse_etf_shares(day):
+    url = 'https://query.sse.com.cn/commonQuery.do?' + urllib.parse.urlencode({
+        'sqlId': 'COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L', 'STAT_DATE': day, 'isPagination': 'false'})
+    data = json_get(url)
+    rows = data.get('result') or (data.get('pageHelp') or {}).get('data') or []
+    shares = {}
+    for r in rows:
+        code, value = r.get('SEC_CODE', ''), number(r.get('TOT_VOL'))
+        if r.get('STAT_DATE') == day and re.fullmatch(r'5\d{5}', code) and value is not None and value >= 0:
+            shares[code] = round(value * 10000)
+    return shares
+
+
+def estimate_etf_flow(dates, navs, shares):
+    points = []
+    for prev, day in zip(dates, dates[1:]):
+        before, after, nav = shares.get(prev), shares.get(day), navs.get(prev)
+        amount = round((after - before) * nav, 2) if before is not None and after is not None and nav is not None else None
+        points.append({'date': day, 'previous_date': prev, 'shares': after, 'previous_shares': before,
+                       'previous_nav': nav, 'netFlow': amount})
+    return points
+
+
+def refresh_etf_flows(records, previous, codes):
+    """Fetch each exchange date once, then estimate each ETF on its own closed trading dates."""
+    plans, wanted = {}, set()
+    for code in codes:
+        if not re.fullmatch(r'5\d{5}', code) or code not in records:
+            continue
+        record = records[code]
+        old = previous.get(code, {}).get('etf_flow') or {}
+        if old.get('rows'):
+            record['etf_flow'] = old
+        dates = sorted({b['date'] for b in record.get('bars', []) if b.get('completed') is True})[-(ETF_FLOW_LIMIT + 1):]
+        if len(dates) < 2:
+            continue
+        cached = {}
+        for row in old.get('rows', []):
+            for date_key, value_key in [('date', 'shares'), ('previous_date', 'previous_shares')]:
+                value = number(row.get(value_key))
+                if row.get(date_key) and value is not None and value >= 0:
+                    cached[row[date_key]] = value
+        wanted.update(day for day in dates if day not in cached)
+        wanted.update(dates[-2:])
+        plans[code] = (dates, cached)
+    if not plans:
+        return
+
+    def read_shares(day):
+        try:
+            return day, load_sse_etf_shares(day)
+        except Exception:
+            return day, {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        daily = dict(pool.map(read_shares, sorted(wanted, reverse=True)))
+        nav_jobs = {code: pool.submit(load_nav_history, code) for code in plans}
+        for code, (dates, cached) in plans.items():
+            record = records[code]
+            issues = record.setdefault('research_errors', {})
+            try:
+                navs, nav_url = nav_jobs[code].result()
+                shares = {**cached, **{day: data[code] for day, data in daily.items() if code in data}}
+                rows = estimate_etf_flow(dates, navs, shares)
+                if not any(r['netFlow'] is not None for r in rows):
+                    raise ValueError('份额与净值未能按相邻交易日对齐')
+                record['etf_flow'] = {'source': ETF_FLOW_SOURCE, 'kind': 'share_nav_estimate', 'currency': 'CNY',
+                                      'nav_url': nav_url, 'rows': rows}
+                issues.pop('etf_flow', None)
+            except Exception as exc:
+                issues['etf_flow'] = str(exc)[:180]
 
 
 # The score model lives in the browser; this layer preserves dated source evidence.
@@ -1064,14 +1148,21 @@ class DataStore:
                 meta = dict(self.catalog[code])
                 previous = json.loads(json.dumps(self.snapshot.get('instruments', {}).get(code, {})))
             _, record = load_watch_record(meta, previous)
+            if meta['market'] == 'CN' and meta['type'] == 'etf' and previous.get('etf_flow'):
+                record['etf_flow'] = previous['etf_flow']
+            if meta['market'] == 'CN' and meta['type'] == 'stock' and previous.get('flows'):
+                # Price refresh can finish before the independent money-flow feed.
+                record['flows'] = previous['flows']
             with self.lock:
                 if self.job_versions.get(code) != version or not self.catalog[code].get('watch') and not self.catalog[code].get('benchmark'):
                     return
-                snapshot = {**self.snapshot, 'instruments': {**self.snapshot.get('instruments', {}), code: record}, 'fetched_at': now(), 'catalog': self.catalog_view()}
+                snapshot = {**self.snapshot, 'instruments': {**self.snapshot.get('instruments', {}), code: json.loads(json.dumps(record))}, 'fetched_at': now(), 'catalog': self.catalog_view()}
                 self.asset_jobs[code]['stage'] = '补充研究数据'
             self.commit_snapshot(snapshot)
             if meta['market'] == 'CN':
                 record = enrich_added_cn(meta, record)
+                if meta['type'] == 'etf' and meta.get('watch'):
+                    refresh_etf_flows({code: record}, {code: previous}, [code])
             else:
                 try:
                     record['fundamentals'], record['financial_history'] = load_international_financials(meta)
@@ -1246,7 +1337,7 @@ class DataStore:
                     retain_valid_history(record, exc)
                     errors[code + ':live'] = str(exc)[:200]
                 old = previous.get('instruments', {}).get(code, {})
-                for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'research_errors', 'research_fetched_at']:
+                for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at']:
                     if key in old:
                         record[key] = old[key]
             # Publish a detached price snapshot before slower research requests finish.
@@ -1272,7 +1363,7 @@ class DataStore:
                 except (KeyError, ValueError, TypeError):
                     pass
                 if age < 21600 and not old.get('research_errors'):
-                    for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'research_errors', 'research_fetched_at']:
+                    for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at']:
                         if key in old:
                             rec[key] = old[key]
                 else:
@@ -1330,6 +1421,10 @@ class DataStore:
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 for _ in pool.map(research, cn_assets):
                     pass
+            etf_codes = [m['code'] for m in active if m['market'] == 'CN' and m['type'] == 'etf' and m.get('watch')]
+            with self.lock:
+                self.state['stage'] = '更新自选ETF净申赎估算'
+            refresh_etf_flows(instruments, previous.get('instruments', {}), etf_codes)
             for meta in active:
                 if meta['market'] != 'CN' and meta['code'] in instruments:
                     try:
@@ -1474,7 +1569,7 @@ class Handler(BaseHTTPRequestHandler):
         if name not in ['index.html', 'styles.css', 'workbench.css', 'data.js', 'engine.js', 'app.js',
                         'views.js', 'research-views.js', 'strategy-views.js', 'local-connector.js', 'bootstrap.js',
                         'lightweight-charts.js', 'lightweight-charts.LICENSE.txt', 'interactive-chart.js', 'evidence-views.js',
-                        'user-state.js', 'record-ui.js', 'themes.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css']:
+                        'user-state.js', 'record-ui.js', 'themes.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css', 'wyckoff-engine.js', 'wyckoff-views.js', 'wyckoff.css']:
             return self.send({'error': 'Not found'}, status=404)
         embedded = globals().get('EMBEDDED_ASSETS', {})
         if name in embedded:
