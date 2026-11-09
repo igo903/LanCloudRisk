@@ -42,6 +42,11 @@ test('real backtest accounting reconciles across dates, allocation, costs and ex
   const r=E.backtest(E.demo,code,p);assert.ok(!r.error);
   near(r.lastEquity-p.capital,r.realizedProfit+(r.units*r.bars.at(-1).close-r.openCost));
   near(r.ret,(r.lastEquity/p.capital-1)*100);assert.equal(r.fillCount,r.trades.length);assert.equal(r.openUnits,r.units);
+  if(r.units){
+   const position=r.openPosition,last=r.bars.at(-1);
+   near(position.value,r.units*last.close);near(position.return,(position.value/r.openCost-1)*100);
+   near(position.profit,position.value-r.openCost);assert.equal(position.date,last.date);
+  }else assert.equal(r.openPosition,null);
   const sells=r.orders.filter(o=>o.cycleReturn!==null),trades=r.trades.filter(t=>t.pnl!==null);
   assert.equal(sells.length,r.completed);sells.forEach((o,i)=>{near(o.cycleReturn,trades[i].pnl);assert.equal(o.cycleBuyCount,1)});
   assert.ok(r.orders.every(o=>o.date>=p.start&&o.date<=p.end));rounds+=sells.length;open+=Number(r.units>0);
@@ -57,6 +62,14 @@ test('orders table renders the new return column, sell value and one final total
  const html=render({...summary,capital:100000,lastEquity:100494,ret:.494,units:0,bars:[{date:'2026-10-30'}]});
  assert.match(html,/本轮收益率（卖出时）/);assert.match(html,/合并 2 笔买入/);assert.match(html,/\+14\.52%/);assert.match(html,/总收益率（当前区间全部成交）/);assert.match(html,/\+0\.49%/);
  assert.equal((html.match(/<tfoot>/g)||[]).length,1);assert.match(html,/含期末未平仓估值/);
+ assert.doesNotMatch(html,/最近一笔持仓收益率/);
+});
+test('remaining position return appears after the account total, even after a skipped sell',()=>{
+ const orders=[filled('buy',100,10,1,'2026-10-29'),{...filled('sell',0,12,0,'2026-10-30'),status:'未成交/跳过'}];
+ const html=render({...E.summarizeOrders(orders),capital:10000,lastEquity:10199,ret:1.99,units:100,bars:[{date:'2026-10-30'}],
+  openPosition:{units:100,cost:1001,value:1200,profit:199,return:199/1001*100,price:12,date:'2026-10-30',buyDate:'2026-10-29'}});
+ assert.match(html,/总收益率（当前区间全部成交）[\s\S]*最近一笔持仓收益率（未实现）/);
+ assert.match(html,/\+19\.88%/);assert.match(html,/剩余买入成本 ¥1001\.00/);assert.match(html,/浮动盈亏 ¥199\.00/);
 });
 test('empty orders table retains its summary row with a dash',()=>{
  const html=render({...E.summarizeOrders([]),ret:0,capital:100000,lastEquity:100000,units:0,bars:[{date:'2026-10-30'}]});

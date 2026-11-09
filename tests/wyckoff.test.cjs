@@ -6,9 +6,28 @@ const base=()=>Array.from({length:80},(_,i)=>bar(i));
 const spring=()=>bar(80,{open:99,high:101,low:97,close:100.5,vol:70});
 const sos=()=>bar(80,{open:101,high:106,low:101,close:105.5,vol:200});
 test('short, empty and invalid histories do not manufacture a conclusion',()=>{
- assert.equal(W.analyze([]).ready,false);assert.equal(W.analyze(base().slice(0,60)).ready,false);
+ assert.equal(W.analyze([]).ready,false);assert.equal(W.analyze(base().slice(0,20)).ready,false);
+ assert.equal(W.analyze(base().slice(0,21)).ready,true);assert.equal(W.analyze(base().slice(0,21)).phase,'样本不足');
  for(const invalid of [bar(80,{high:99}),bar(0),bar(80,{close:NaN})])assert.equal(W.analyze([...base(),invalid]).ready,false);
  const b=base();b[10].vol=null;assert.equal(W.analyze(b).ready,true);
+});
+test('short-history support absorption needs repeated support, a lower wick and usable volume',()=>{
+ const prefix=base().slice(0,20),values={open:100,high:102,low:98.1,close:101,vol:114};
+ const signal=W.analyze([...prefix,bar(20,values)]).events.at(-1);
+ assert.equal(signal.type,'Support');assert.equal(signal.window,20);assert.ok(signal.touches>=2);
+ for(const vol of [0,90])assert.equal(W.analyze([...prefix,bar(20,{...values,vol})]).events.length,0);
+});
+test('a repeatedly tested local range can identify a Spring inside the wider 40-day range',()=>{
+ const input=base();input[45]=bar(45,{low:90,high:112});
+ const event=W.analyze([...input,spring()]).events.find(e=>e.date===date(80));
+ assert.equal(event.type,'Spring');assert.equal(event.window,20);assert.equal(event.level,98);
+ input[65]=bar(65,{low:94});
+ assert.ok(!W.analyze([...input,bar(80,{open:95,high:101,low:93,close:99,vol:90})]).events.some(e=>e.date===date(80)));
+});
+test('moderately higher volume and wider spread can qualify for SOS with directional price confirmation',()=>{
+ const values={open:101,high:105.5,low:101,close:105,vol:128};
+ assert.equal(W.analyze([...base(),bar(80,values)]).events.at(-1).type,'SOS');
+ assert.equal(W.analyze([...base(),bar(80,{...values,vol:100})]).events.length,0);
 });
 test('rolling levels and volume baselines exclude the event bar itself',()=>{
  const input=[...base(),sos()],before=JSON.stringify(input),m=W.analyze(input);
@@ -28,6 +47,15 @@ test('Test and LPS require their prior Spring or SOS event chain',()=>{
  assert.equal(W.analyze([...base(),spring(),testBar]).events.at(-1).type,'Test');
  assert.ok(!W.analyze([...base(),bar(80),testBar]).events.some(e=>e.type==='Test'));
  const lps=bar(81,{open:103,high:103.5,low:101,close:102.5,vol:50});assert.equal(W.analyze([...base(),sos(),lps]).events.at(-1).type,'LPS');
+});
+test('LPS cannot validate before its parent SOS, even when its own trigger was crossed',()=>{
+ const lps=bar(81,{open:103,high:103.5,low:101,close:102.5,vol:50});
+ const b=bar(82,{open:103,high:104.5,low:102.5,close:104,vol:90});
+ const input=[...base(),sos(),lps,b,continuation(83)];
+ const at82=W.analyze(input,{end:date(82)}).events.find(e=>e.type==='LPS');
+ const at83=W.analyze(input).events.find(e=>e.type==='LPS');
+ assert.ok(b.close>at82.trigger);assert.equal(at82.status,'pending');
+ assert.equal(at83.status,'validated');assert.equal(at83.confirmAt,date(83));
 });
 test('confirmation carries its own knowledge date and is unavailable before that date',()=>{
  const input=[...base(),spring(),bar(81,{open:101,high:103,low:100,close:102.5})];
@@ -91,6 +119,21 @@ test('integrated execution uses next session, and chart-ready signals follow the
  const on=E.backtest(data,'002281',{...p,wyckoff:true});assert.equal(on.signals[0].date,date(81));assert.equal(on.orders[0].signal,date(81));assert.equal(on.orders[0].date,date(82));assert.equal(on.orders[0].status,'模拟成交');
  assert.equal(E.backtest(data,'002281',{...p,wyckoff:true,marketGate:true}).orders[0].status,'未成交/跳过');
  const end=E.backtest(data,'002281',{...p,wyckoff:true,end:date(81)});assert.equal(end.signals.length,1);assert.equal(end.orders.length,0);
+ bars.push(continuation(83,{close:500,high:510,completed:false}));
+ const live=E.backtest(data,'002281',{...p,wyckoff:true,end:date(83)});
+ assert.deepEqual(live.openPosition,on.openPosition);assert.equal(live.openPosition.date,date(82));
+});
+test('research signals explain both factor adjustments and unconfirmed shapes when the factor is off',()=>{
+ const input=[...base(),sos(),continuation(81)],model=W.integrate(input,[]);
+ const c=vm.createContext({WyckoffEngine:W,E:{series:()=>input},data:()=>({}),asset:()=>({code:'002281'}),
+  bt:{wyckoff:false,start:date(80),end:date(80)},esc:x=>String(x??''),num:(x,n=2)=>x==null?'—':x.toFixed(n),face:()=>'',pill:s=>s});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../dist','wyckoff-views.js'),'utf8'),c);
+ const research=vm.runInContext('wyckoffResearchTable({wyckoff:null})',c);
+ assert.match(research,/因子已关闭/);assert.match(research,/SOS · 强势信号/);assert.match(research,/待验证/);
+ assert.match(research,/阻力 102\.000/);assert.match(research,/量比 2\.00×/);assert.match(research,/收盘高于 105\.500/);
+ c.result={signals:model.signals,wyckoff:model};
+ const active=vm.runInContext('backtestSignalTable(result)',c);
+ assert.match(active,/威科夫新增/);assert.match(active,/收盘 106\.500 高于验证价 105\.500/);
 });
 test('blue triangles stack below supported faces, excluding provisional and filtered signals',()=>{
  const c=vm.createContext({});vm.runInContext(fs.readFileSync(path.join(__dirname,'../dist','interactive-chart.js'),'utf8'),c);
