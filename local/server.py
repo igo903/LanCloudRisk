@@ -3,6 +3,8 @@
 import argparse
 import concurrent.futures
 import datetime as dt
+import errno
+import ipaddress
 import json
 import math
 import os
@@ -40,8 +42,11 @@ SYMBOLS.update({c: 'sh' + c for c, _, _ in SECTOR_ASSETS})
 SINA = 'https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService.getKLineData'
 TENCENT = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
 QUOTE = 'https://qt.gtimg.cn/q='
+SINA_QUOTE = 'https://hq.sinajs.cn/list='
 TOKEN = secrets.token_urlsafe(24)
 NETWORK_LIMIT = threading.BoundedSemaphore(8)
+DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+PROXY_MODE = 'auto'
 EXTERNAL_SYMBOLS = ['usSOXX', 'usQQQ', 'usNVDA', 'usMU', 'usTSM', 'usAVGO', 'hkHSTECH', 'usVIX']
 
 
@@ -49,16 +54,57 @@ def now():
     return dt.datetime.now(TZ).isoformat(timespec='seconds')
 
 
+def local_proxy_address(host, scheme):
+    proxy = urllib.request.getproxies().get(scheme)
+    if not proxy or urllib.request.proxy_bypass(host):
+        return None
+    try:
+        address = urllib.parse.urlsplit(proxy if '://' in proxy else '//' + proxy)
+        name = address.hostname or ''
+        if name.lower() != 'localhost' and not ipaddress.ip_address(name).is_loopback:
+            return None
+        port = address.port or (443 if address.scheme == 'https' else 80)
+        return f'[{name}]:{port}' if ':' in name else f'{name}:{port}'
+    except ValueError:
+        return None
+
+
+def connection_refused(exc):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, ConnectionRefusedError) or getattr(reason, 'errno', None) in (errno.ECONNREFUSED, 61, 10061)
+
+
 def fetch(url):
-    host = urllib.parse.urlsplit(url).hostname or ''
+    target = urllib.parse.urlsplit(url)
+    host = target.hostname or ''
     referer = 'https://www.sse.com.cn/' if host == 'query.sse.com.cn' else 'https://fundf10.eastmoney.com/' if host.startswith(('fund', 'fundf10')) else 'https://quote.eastmoney.com/' if host.endswith('eastmoney.com') else 'https://finance.sina.com.cn/'
-    req = urllib.request.Request(url, headers={
+    headers = {
         'User-Agent': 'Mozilla/5.0 RiskLensLocal/0.9.0',
         'Referer': referer,
-    })
+    }
+    def read(open_url):
+        # ProxyHandler mutates the request. Each route needs a fresh request.
+        req = urllib.request.Request(url, headers=headers)
+        with open_url(req, timeout=12) as response:
+            return response.read(8 * 1024 * 1024 + 1)
     with NETWORK_LIMIT:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            body = response.read(8 * 1024 * 1024 + 1)
+        direct = PROXY_MODE == 'direct'
+        try:
+            body = read(DIRECT_OPENER.open if direct else urllib.request.urlopen)
+        except OSError as exc:
+            if not connection_refused(exc):
+                raise
+            proxy = None if direct else local_proxy_address(target.netloc, target.scheme)
+            if not proxy:
+                raise ConnectionError(f'{host}：行情连接被拒绝，请检查网络或代理设置') from exc
+            message = f'{host}：本机代理 {proxy} 拒绝连接'
+            if PROXY_MODE == 'system':
+                raise ConnectionError(message + '；请启动代理或修正系统代理设置') from exc
+            try:
+                body = read(DIRECT_OPENER.open)
+            except OSError as direct_error:
+                detail = '连接被拒绝' if connection_refused(direct_error) else str(direct_error)
+                raise ConnectionError(f'{message}；直连也失败：{detail}。请启动代理或检查网络') from direct_error
     if len(body) > 8 * 1024 * 1024:
         raise ValueError('行情响应超过8MB')
     return body
@@ -92,6 +138,42 @@ def parse_quotes(raw):
                        'previous_close': float(fields[4]), 'source': '腾讯公开行情',
                        'volume_basis': '科创板原股数' if factor == 1 else '手×100股/份'}
     return output
+
+
+def parse_sina_quotes(raw):
+    output = {}
+    for symbol, payload in re.findall(r'\bhq_str_((?:sh|sz|bj)\d{6})="([^"]*)"', raw.decode('gb18030')):
+        fields = payload.split(',')
+        if len(fields) < 32 or not fields[0].strip():
+            continue
+        try:
+            stamp = dt.datetime.fromisoformat(fields[30] + 'T' + fields[31]).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+        price = number(fields[3])
+        if price is None or price <= 0 or stamp > dt.datetime.now(TZ):
+            continue
+        output[symbol] = {'name': fields[0].strip(), 'code': symbol[2:], 'price': price,
+                          'timestamp': stamp.isoformat(), 'date': stamp.date().isoformat(),
+                          'open': number(fields[1]), 'high': number(fields[4]), 'low': number(fields[5]),
+                          'volume': number(fields[8]), 'amount': number(fields[9]), 'turnover': None,
+                          'previous_close': number(fields[2]), 'source': '新浪公开行情', 'volume_basis': '股/份'}
+    return output
+
+
+def load_cn_quotes(symbols):
+    requested = set(symbols)
+    query = ','.join(symbols)
+    errors = []
+    for name, endpoint, parse in [('腾讯', QUOTE, parse_quotes), ('新浪', SINA_QUOTE, parse_sina_quotes)]:
+        try:
+            quotes = {s: q for s, q in parse(fetch(endpoint + query)).items() if s in requested}
+            if quotes:
+                return quotes
+            raise ValueError('未返回有效报价')
+        except (OSError, ValueError) as exc:
+            errors.append(f'{name}报价：{str(exc)[:165]}')
+    raise ConnectionError('；'.join(errors))
 
 
 def parse_sina(raw):
@@ -165,7 +247,8 @@ def load_asset(asset, quotes, previous=None):
             # Tencent native K-line volume has board-specific units. Keep them explicit;
             # only ratios use this field. No absolute share-volume calculations are exposed.
             unit = '股/份' if provider == '新浪日线' else '供应商原始单位（仅计算量比）'
-            return code, {'source': provider + '（未复权）+ 腾讯名称核验', 'as_of': bars[-1]['date'],
+            quote_source = quote.get('source', '腾讯公开行情')
+            return code, {'source': f'{provider}（未复权）+ {quote_source}名称核验', 'as_of': bars[-1]['date'],
                           'adjustment': 'none', 'completed': bars[-1]['completed'], 'bars': bars,
                           'fundamentals': None, 'fetched_at': now(), 'latest_quote': quote,
                           'volume_unit': unit, 'provider_url': url, 'skipped_rows': skipped,
@@ -183,13 +266,17 @@ def patch_quote(record, quote):
     keys = ['open', 'high', 'low', 'price', 'volume']
     if not all(isinstance(quote.get(k), (int, float)) and math.isfinite(quote[k]) for k in keys):
         raise ValueError('最新报价缺少完整OHLC/累计量')
-    if min(quote[k] for k in keys[:4]) <= 0 or quote['low'] > min(quote['open'], quote['price']) or quote['high'] < max(quote['open'], quote['price']):
+    if min(quote[k] for k in keys[:4]) <= 0 or quote['volume'] < 0 or quote['low'] > min(quote['open'], quote['price']) or quote['high'] < max(quote['open'], quote['price']):
         raise ValueError('最新报价OHLC不一致')
-    stamp = dt.datetime.fromisoformat(quote['timestamp'])
+    initial = record['latest_quote']
+    if (quote['code'], quote.get('name')) != (initial['code'], initial['name']):
+        raise ValueError('二次报价名称或代码未通过核验')
+    if quote['date'] < record['bars'][-1]['date'] or quote['timestamp'] < initial.get('timestamp', ''):
+        raise ValueError('二次报价早于已取得的行情')
     completed = stamp.hour >= 15 and dt.datetime.now(TZ) >= stamp
     live = {'date': quote['date'], 'open': quote['open'], 'high': quote['high'], 'low': quote['low'],
             'close': quote['price'], 'vol': quote['volume'], 'netFlow': None, 'completed': completed,
-            'observed_at': quote['timestamp'], 'bar_source': '腾讯累计实时报价组装日K'}
+            'observed_at': quote['timestamp'], 'bar_source': quote.get('source', '腾讯公开行情') + '累计报价组装日K'}
     # Only combine homogeneous share/lot units; Sina uses shares. Tencent fallback
     # K-lines on the main board use lots, whereas STAR-board bars already use shares.
     if record['volume_unit'] != '股/份':
@@ -197,8 +284,6 @@ def patch_quote(record, quote):
         for b in record['bars']:
             b['vol'] *= factor
         record['volume_unit'] = '股/份'
-    if live['date'] < record['bars'][-1]['date']:
-        return  # Never overwrite a newer history endpoint with a delayed quote.
     record['bars'] = [b for b in record['bars'] if b['date'] != live['date']] + [live]
     record.update(as_of=live['date'], completed=completed, latest_quote=quote, fetched_at=now(),
                   closed_as_of=max((b['date'] for b in record['bars'] if b.get('completed')), default=None))
@@ -793,7 +878,7 @@ def resolve_security(market, symbol):
         raise ValueError('证券搜索源未确认该标的；请从搜索结果添加')
     meta = dict(meta)
     if market == 'CN':
-        quote = parse_quotes(fetch(QUOTE + meta['provider_symbol'])).get(meta['provider_symbol'])
+        quote = load_cn_quotes([meta['provider_symbol']]).get(meta['provider_symbol'])
         if not quote or quote['code'] != code or quote['name'] != meta['name']:
             raise ValueError('证券名称与报价源核验不一致')
     else:
@@ -895,13 +980,13 @@ def load_watch_record(meta, previous=None, quotes=None):
         return load_international_asset(meta, previous)
     symbol = meta['provider_symbol']
     SYMBOLS[meta['code']] = symbol
-    quotes = quotes if quotes is not None else parse_quotes(fetch(QUOTE + symbol))
+    quotes = quotes if quotes is not None else load_cn_quotes([symbol])
     code, record = load_asset((meta['code'], meta['name'], meta.get('listed')), quotes)
     target = max((b['date'] for b in record['bars'] if b['date'] < quotes[symbol]['date']), default=None)
     if target:
         verify_previous(record, previous, target)
     try:
-        patch_quote(record, parse_quotes(fetch(QUOTE + symbol))[symbol])
+        patch_quote(record, load_cn_quotes([symbol])[symbol])
     except Exception as exc:
         # Bad or unavailable live OHLC must not erase independently validated daily history.
         retain_valid_history(record, exc)
@@ -989,7 +1074,7 @@ def screening_member(holding):
 def load_screening_record(meta, previous=None):
     meta = dict(meta)
     if meta['market'] == 'CN':
-        quote = parse_quotes(fetch(QUOTE + meta['provider_symbol'])).get(meta['provider_symbol'])
+        quote = load_cn_quotes([meta['provider_symbol']]).get(meta['provider_symbol'])
         if not quote or quote.get('code') != meta['code']:
             raise ValueError('披露持股代码与报价身份不一致')
         meta['name'] = quote['name']
@@ -1306,9 +1391,15 @@ class DataStore:
             cn_active = [m for m in active if m['market'] == 'CN']
             cn_assets = [(m['code'], m['name'], m.get('listed')) for m in cn_active]
             quote_symbols = [m['provider_symbol'] for m in cn_active] + [SYMBOLS[a[0]] for a in SECTOR_ASSETS]
-            quotes = parse_quotes(fetch(QUOTE + ','.join(quote_symbols)))
+            try:
+                quotes = load_cn_quotes(quote_symbols)
+            except OSError as exc:
+                errors['A股初始报价'] = str(exc)
+                with self.lock:
+                    self.state['errors'] = dict(errors)
+                quotes = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(load_asset, a, quotes): a[0] for a in cn_assets}
+                futures = {pool.submit(load_asset, a, quotes): a[0] for a in cn_assets} if quotes else {}
                 futures.update({pool.submit(load_international_asset, m, previous.get('instruments', {}).get(m['code'])): m['code'] for m in active if m['market'] != 'CN'})
                 for future in concurrent.futures.as_completed(futures):
                     code = futures[future]
@@ -1319,23 +1410,35 @@ class DataStore:
                         errors[code] = str(exc)[:400]
                     with self.lock:
                         self.state['done'] += 1
-            reference = instruments.get('510300') or next(iter(instruments.values()), None)
+            reference = instruments.get('510300') or next((instruments[a[0]] for a in cn_assets if a[0] in instruments), None)
             reference_day = max((q['date'] for q in quotes.values()), default=dt.datetime.now(TZ).date().isoformat())
             target = max((b['date'] for b in (reference or {}).get('bars', []) if b['date'] < reference_day), default=None)
+            previous_session = max(filter(None, (target, previous.get('previous_session'))), default=None)
             for code, record in instruments.items():
                 if target and self.catalog[code]['market'] == 'CN':
                     verify_previous(record, previous.get('instruments', {}).get(code), target)
             with self.lock:
                 self.state['stage'] = '更新当天实时日K'
-            fresh_quotes = parse_quotes(fetch(QUOTE + ','.join(quote_symbols)))
+            fresh_quotes, live_error = {}, None
+            if quotes:
+                try:
+                    fresh_quotes = load_cn_quotes(quote_symbols)
+                except OSError as exc:
+                    live_error = str(exc)
+                    errors['A股二次报价'] = live_error
+                    with self.lock:
+                        self.state['errors'] = dict(errors)
             for code, record in instruments.items():
                 if self.catalog[code]['market'] != 'CN':
                     continue
                 try:
+                    if live_error:
+                        raise ConnectionError(live_error)
                     patch_quote(record, fresh_quotes[SYMBOLS[code]])
                 except Exception as exc:
                     retain_valid_history(record, exc)
-                    errors[code + ':live'] = str(exc)[:200]
+                    if not live_error:
+                        errors[code + ':live'] = str(exc)[:200]
                 old = previous.get('instruments', {}).get(code, {})
                 for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at']:
                     if key in old:
@@ -1345,7 +1448,7 @@ class DataStore:
             if instruments:
                 interim = {'schema_version': 4, 'data_kind': 'local', 'as_of': max(r['as_of'] for r in instruments.values()),
                            'closed_as_of': min(r.get('closed_as_of') or r['as_of'] for r in instruments.values()),
-                           'previous_session': target, 'fetched_at': now(), 'instruments': instruments, 'catalog': self.catalog_view(),
+                           'previous_session': previous_session, 'fetched_at': now(), 'instruments': instruments, 'catalog': self.catalog_view(),
                            'external': previous.get('external', []), 'geopolitics': previous.get('geopolitics', {}), 'sectors': previous.get('sectors', []), 'errors': errors}
                 self.commit_snapshot(json.loads(json.dumps(interim)))
             with self.lock:
@@ -1431,8 +1534,10 @@ class DataStore:
                         instruments[meta['code']]['fundamentals'], instruments[meta['code']]['financial_history'] = load_international_financials(meta)
                     except Exception as exc:
                         instruments[meta['code']].setdefault('research_errors', {})['financials'] = str(exc)[:180]
+            has_external_update = False
             try:
                 external = load_external()
+                has_external_update = any(r.get('price') is not None and not r.get('error') for r in external)
             except Exception as exc:
                 external = previous.get('external', [])
                 errors['external'] = str(exc)[:180]
@@ -1442,21 +1547,22 @@ class DataStore:
             except Exception as exc:
                 geopolitics = {**previous.get('geopolitics', {}), 'error': str(exc)[:180]}
                 errors['geopolitics'] = str(exc)[:180]
-            sectors = []
-            for a in SECTOR_ASSETS:
+            sectors = {s['code']: s for s in previous.get('sectors', [])}
+            for a in SECTOR_ASSETS if fresh_quotes else []:
                 try:
                     _, sector = load_asset(a, fresh_quotes)
                     patch_quote(sector, fresh_quotes[SYMBOLS[a[0]]])
-                    sectors.append({'code': a[0], 'name': a[1], **sector})
+                    if sector['as_of'] >= sectors.get(a[0], {}).get('as_of', ''):
+                        sectors[a[0]] = {'code': a[0], 'name': a[1], **sector}
                 except Exception as exc:
                     errors['sector:' + a[0]] = str(exc)[:180]
             snapshot = {'schema_version': 4, 'data_kind': 'local',
                         'as_of': max((r['as_of'] for r in instruments.values()), default=None),
                         'closed_as_of': min((r.get('closed_as_of') or r['as_of'] for r in instruments.values()), default=None),
-                        'fetched_at': now(), 'previous_session': target, 'external': external, 'geopolitics': geopolitics, 'sectors': sectors,
+                        'fetched_at': now(), 'previous_session': previous_session, 'external': external, 'geopolitics': geopolitics, 'sectors': list(sectors.values()),
                         'instruments': instruments, 'catalog': self.catalog_view(), 'errors': errors}
-            # Preserve the previous successful cache only if every request failed.
-            if instruments:
+            # Keep the previous snapshot timestamp when no price observations were retrieved.
+            if instruments or has_external_update:
                 self.commit_snapshot(snapshot)
         except Exception as exc:
             errors['provider'] = str(exc)[:400]
@@ -1476,7 +1582,14 @@ class DataStore:
                         if code not in enabled:
                             continue
                         old = records.get(code, {})
-                        if str(record.get('history_checked_at') or '') >= str(old.get('history_checked_at') or ''):
+                        if old.get('as_of') == record.get('as_of') and old.get('bars') and record.get('bars'):
+                            old_bar, new_bar = old['bars'][-1], record['bars'][-1]
+                            if ((old_bar.get('completed') is True and new_bar.get('completed') is False)
+                                    or (old_bar.get('completed') == new_bar.get('completed')
+                                        and str(old_bar.get('observed_at') or '') > str(new_bar.get('observed_at') or ''))):
+                                continue
+                        if (str(record.get('as_of') or '') >= str(old.get('as_of') or '')
+                                and str(record.get('history_checked_at') or '') >= str(old.get('history_checked_at') or '')):
                             records[code] = record
                     self.data_revision += 1
                     snapshot = {**snapshot, 'instruments': records, 'catalog': self.catalog_view(), 'watchlist_revision': self.watchlist_revision, 'data_revision': self.data_revision}
@@ -1618,14 +1731,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global PROXY_MODE
     parser = argparse.ArgumentParser(description='观澜本地数据环境（只读行情，不连接券商）')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--cache', default=str(Path.home() / '.risklens' / 'market-cache.json'))
     parser.add_argument('--no-browser', action='store_true')
     parser.add_argument('--no-refresh', action='store_true')
+    parser.add_argument('--proxy-mode', choices=('auto', 'system', 'direct'), default='auto',
+                        help='auto：本机代理拒绝连接时重试直连；system：只按系统设置；direct：始终直连')
     parser.add_argument('--strictPort', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    PROXY_MODE = args.proxy_mode
     store = DataStore(args.cache)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.store = store
