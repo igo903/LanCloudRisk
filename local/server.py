@@ -43,11 +43,24 @@ SINA = 'https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService
 TENCENT = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
 QUOTE = 'https://qt.gtimg.cn/q='
 SINA_QUOTE = 'https://hq.sinajs.cn/list='
+IFIND_ENDPOINT = 'https://api-mcp.51ifind.com:8643/ds-mcp-servers/hexin-ifind-ds-{}-mcp'
 TOKEN = secrets.token_urlsafe(24)
 NETWORK_LIMIT = threading.BoundedSemaphore(8)
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PROXY_MODE = 'auto'
 EXTERNAL_SYMBOLS = ['usSOXX', 'usQQQ', 'usNVDA', 'usMU', 'usTSM', 'usAVGO', 'hkHSTECH', 'usVIX']
+
+
+class NoMarketRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+IFIND_OPENER = urllib.request.build_opener(NoMarketRedirect())
+IFIND_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoMarketRedirect())
+IFIND_LOCK = threading.Lock()
+IFIND_SETTINGS_LOCK = threading.Lock()
+IFIND_NEXT_CALL = 0
 
 
 def now():
@@ -116,10 +129,13 @@ def parse_quotes(raw):
         fields = payload.split('~')
         if len(fields) <= 30 or not re.fullmatch(r'\d{14}', fields[30]):
             continue
-        price = float(fields[3])
-        if not math.isfinite(price) or price <= 0:
+        price = number(fields[3])
+        if price is None or price <= 0:
             continue
-        stamp = dt.datetime.strptime(fields[30], '%Y%m%d%H%M%S').replace(tzinfo=TZ)
+        try:
+            stamp = dt.datetime.strptime(fields[30], '%Y%m%d%H%M%S').replace(tzinfo=TZ)
+        except ValueError:
+            continue
         def value(index):
             try:
                 n = float(fields[index])
@@ -128,14 +144,14 @@ def parse_quotes(raw):
                 return None
         raw_volume = value(6)
         amount_parts = fields[35].split('/') if len(fields) > 35 else []
-        amount = float(amount_parts[-1]) if len(amount_parts) == 3 else None
+        amount = number(amount_parts[-1]) if len(amount_parts) == 3 else None
         factor = 1 if fields[2].startswith(('688', '689')) else 100
-        output[sym] = {'name': fields[1], 'code': fields[2], 'price': price,
+        output[sym] = {'name': fields[1].strip(), 'code': fields[2], 'price': price,
                        'timestamp': stamp.isoformat(), 'date': stamp.date().isoformat(),
                        'open': value(5), 'high': value(33), 'low': value(34),
                        'volume': raw_volume * factor if raw_volume is not None else None,
                        'amount': amount, 'turnover': value(38),
-                       'previous_close': float(fields[4]), 'source': '腾讯公开行情',
+                       'previous_close': value(4), 'source': '腾讯公开行情',
                        'volume_basis': '科创板原股数' if factor == 1 else '手×100股/份'}
     return output
 
@@ -161,19 +177,336 @@ def parse_sina_quotes(raw):
     return output
 
 
-def load_cn_quotes(symbols):
-    requested = set(symbols)
-    query = ','.join(symbols)
-    errors = []
-    for name, endpoint, parse in [('腾讯', QUOTE, parse_quotes), ('新浪', SINA_QUOTE, parse_sina_quotes)]:
+def ifind_settings_path():
+    return Path.home() / '.risklens' / 'ifind.json'
+
+
+def validate_ifind_token(value):
+    token = value.strip() if isinstance(value, str) else ''
+    if not re.fullmatch(r'[!-~]{1,2048}', token):
+        raise ValueError('iFinD 密钥格式无效')
+    return token
+
+
+def read_ifind_settings(path, optional=False):
+    try:
+        with path.open(encoding='utf-8') as handle:
+            return validate_ifind_token(json.loads(handle.read(4096))['auth_token'])
+    except FileNotFoundError:
+        if optional:
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    raise ValueError('无法读取本地 iFinD 密钥配置（需要有效的 auth_token）')
+
+
+def ifind_token():
+    saved = read_ifind_settings(ifind_settings_path(), optional=True)
+    if saved:
+        return saved
+    token = os.environ.get('IFIND_MCP_TOKEN', '').strip()
+    if token and token != 'your ifind-mcp key':
+        return validate_ifind_token(token)
+    config = os.environ.get('IFIND_MCP_CONFIG')
+    if config:
+        return read_ifind_settings(Path(config).expanduser())
+    raise ValueError('未配置本地 iFinD 密钥，请在「数据与方法」配置')
+
+
+def save_ifind_settings(token):
+    path = ifind_settings_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix='.ifind-', suffix='.tmp', delete=False) as handle:
+            temp = Path(handle.name)
+            json.dump({'auth_token': token}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+
+
+def ifind_connection_status():
+    try:
+        ifind_token()
+        return {'configured': True}
+    except ValueError as exc:
+        return {'configured': False, 'message': str(exc)}
+
+
+def ifind_post(service, token, method, request_id=None, params=None, session=None, version=None):
+    url = IFIND_ENDPOINT.format(service)
+    data = {'jsonrpc': '2.0', 'method': method}
+    if request_id is not None:
+        data.update(id=request_id, params=params)
+    headers = {'Authorization': token, 'Content-Type': 'application/json',
+               'Accept': 'application/json, text/event-stream'}
+    if session:
+        headers['Mcp-Session-Id'] = session
+    if version:
+        headers['MCP-Protocol-Version'] = version
+
+    def read(opener):
+        req = urllib.request.Request(url, json.dumps(data, ensure_ascii=False).encode('utf-8'), headers)
+        with opener.open(req, timeout=6) as response:
+            response_session = response.headers.get('Mcp-Session-Id')
+            if request_id is None:
+                return {}, response_session
+            if response.headers.get_content_type() != 'text/event-stream':
+                payload = response.read(1024 * 1024 + 1)
+                if len(payload) > 1024 * 1024:
+                    raise ValueError('iFinD 响应超过大小上限')
+                return json.loads(payload), response_session
+            lines, size = [], 0
+            while True:
+                line = response.readline(1024 * 1024 + 1)
+                size += len(line)
+                if size > 1024 * 1024 or not line:
+                    raise ValueError('iFinD 事件流未返回完整响应')
+                if line.startswith(b'data:'):
+                    lines.append(line[5:].strip())
+                if not line.strip() and lines:
+                    payload = json.loads(b'\n'.join(lines))
+                    if isinstance(payload, dict) and payload.get('id') == request_id:
+                        return payload, response_session
+                    lines.clear()
+
+    with NETWORK_LIMIT:
         try:
-            quotes = {s: q for s, q in parse(fetch(endpoint + query)).items() if s in requested}
-            if quotes:
-                return quotes
-            raise ValueError('未返回有效报价')
+            response, response_session = read(IFIND_DIRECT if PROXY_MODE == 'direct' else IFIND_OPENER)
+        except OSError as exc:
+            host = urllib.parse.urlsplit(url).netloc
+            if PROXY_MODE != 'auto' or not connection_refused(exc) or not local_proxy_address(host, 'https'):
+                raise
+            response, response_session = read(IFIND_DIRECT)
+    if request_id is None:
+        return {}, response_session
+    if not isinstance(response, dict) or response.get('id') != request_id:
+        raise ValueError('iFinD 返回了无法匹配的 MCP 响应')
+    if 'error' in response:
+        error = response['error']
+        code = error.get('code') if isinstance(error, dict) else None
+        raise ValueError(f'iFinD MCP {method} 失败（错误码 {code if isinstance(code, int) else "未知"}）')
+    result = response.get('result')
+    if not isinstance(result, dict) or result.get('isError'):
+        raise ValueError(f'iFinD MCP {method} 未成功（请检查工具权限、额度或返回格式）')
+    return result, response_session
+
+
+def parse_ifind_quotes(result, symbols):
+    # MCP can wrap structured output in text containing JSON. Ignore free-form
+    # prose rather than guessing a symbol, trading timestamp or volume unit.
+    wanted = {s[2:] + '.' + s[:2].upper(): s for s in symbols}
+    rows = result.get('structuredContent') or result.get('content') or result
+    quotes = {}
+
+    def visit(node):
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+        if not isinstance(node, dict):
+            return
+        if node.get('type') == 'text' and isinstance(node.get('text'), str):
+            try:
+                raw = node['text'].strip()
+                fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', raw, re.S | re.I)
+                visit(json.loads(fenced[1] if fenced else raw))
+            except (ValueError, RecursionError):
+                pass
+            return
+        for key in ('data', 'rows', 'quotes', 'tables'):
+            if isinstance(node.get(key), (list, dict)):
+                visit(node[key])
+
+        values = {**node, **node['table']} if isinstance(node.get('table'), dict) else node
+
+        def field(*keys):
+            for key in keys:
+                value = values.get(key)
+                if isinstance(value, list) and len(value) == 1:
+                    value = value[0]
+                if value is not None:
+                    return value
+            return None
+
+        code = str(field('thscode', 'thsCode', 'symbol', 'code', '证券代码', '同花顺代码') or '').strip().upper()
+        exact_symbol = wanted.get(code)
+        symbol = exact_symbol or next((s for s in symbols if s[2:] == code), None)
+        name = field('name', 'security_name', 'securityName', '证券简称', '证券名称')
+        stamp = field('timestamp', 'datetime', 'tradeTime', '行情时间', '更新时间', '时间', 'time')
+        day = field('date', '交易日期', '日期')
+        if isinstance(day, str) and isinstance(stamp, str) and re.fullmatch(r'\d{2}:\d{2}(?::\d{2})?', stamp):
+            stamp = day + 'T' + stamp
+        if not symbol:
+            return
+        try:
+            if isinstance(stamp, str) and len(stamp) >= 16:
+                timestamp = dt.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+            elif isinstance(stamp, int) and 10 <= len(str(stamp)) <= 13:
+                timestamp = dt.datetime.fromtimestamp(stamp / 1000 if stamp >= 10**12 else stamp, TZ)
+            else:
+                return
+        except (ValueError, OverflowError, OSError):
+            return
+        timestamp = timestamp.astimezone(TZ) if timestamp.tzinfo else timestamp.replace(tzinfo=TZ)
+        price = number(field('最新价', 'price', 'latest', 'latest_price', 'latestPrice'))
+        volume = number(field('成交量(股)', '成交量（股）', '成交量(份)', '成交量（份）'))
+        unit = field('volume_unit', '成交量单位')
+        if volume is None and unit in ('股', '份', '股/份', 'shares'):
+            volume = number(field('成交量', 'volume'))
+        if price is None or price <= 0 or timestamp > dt.datetime.now(TZ):
+            return
+        quote = {'name': name.strip() if isinstance(name, str) else None, 'code': symbol[2:], 'price': price,
+                 'timestamp': timestamp.isoformat(), 'date': timestamp.date().isoformat(),
+                 'open': number(field('开盘价', 'open', 'openPrice')), 'high': number(field('最高价', 'high', 'highPrice')),
+                 'low': number(field('最低价', 'low', 'lowPrice')), 'volume': volume, 'amount': None,
+                 'turnover': None, 'previous_close': None, 'source': '同花顺 iFinD Level 1',
+                 'volume_basis': '股/份' if volume is not None else None, 'qualified_code': code if exact_symbol else None}
+        if quote['timestamp'] >= quotes.get(symbol, {}).get('timestamp', ''):
+            quotes[symbol] = quote
+
+    visit(rows)
+    return quotes
+
+
+def load_ifind_quotes(symbols, failures, token=None):
+    global IFIND_NEXT_CALL
+    token = ifind_token() if token is None else token
+    quotes = {}
+    for service in ('stock', 'fund'):
+        group = [s for s in symbols if (s[2:].startswith(('15', '16', '5'))) == (service == 'fund')]
+        if not group:
+            continue
+        try:
+            result, session = ifind_post(service, token, 'initialize', 1, {
+                'protocolVersion': '2025-03-26', 'capabilities': {},
+                'clientInfo': {'name': 'LanCloudRisk', 'version': '0.9.0'},
+            })
+            version = result.get('protocolVersion') or '2025-03-26'
+            ifind_post(service, token, 'notifications/initialized', session=session, version=version)
+            for i in range(0, len(group), 10):
+                batch = group[i:i+10]
+                with IFIND_LOCK:
+                    time.sleep(max(0, IFIND_NEXT_CALL - time.monotonic()))
+                    IFIND_NEXT_CALL = time.monotonic() + 0.5
+                    result, _ = ifind_post(service, token, 'tools/call', 2+i, {
+                        'name': service + '_highfreq_quotes',
+                        'arguments': {'symbols': ','.join(s[2:] + '.' + s[:2].upper() for s in batch),
+                                      'indicators': '最新价,开盘价,最高价,最低价,成交量', 'data_mode': 'real_time'},
+                    }, session=session, version=version)
+                quotes.update(parse_ifind_quotes(result, batch))
+        except urllib.error.HTTPError as exc:
+            hint = {401: '密钥未获授权', 403: '访问被拒绝，请检查密钥与工具权限',
+                    429: '请求受限，请检查额度与调用频率'}.get(exc.code)
+            failures.append(f'{service} HTTP {exc.code}' + (f'（{hint}）' if hint else ''))
+        except OSError as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            failures.append(f'{service} 连接失败（{type(reason).__name__}，{str(reason).replace(token, "[已隐藏]")[:100]}）')
+        except (ValueError, RecursionError) as exc:
+            failures.append(f'{service}：{str(exc).replace(token, "[已隐藏]")[:130]}')
+    return quotes
+
+
+def test_ifind_connection(payload):
+    has_new_key = 'token' in payload
+    token = validate_ifind_token(payload['token']) if has_new_key else ifind_token()
+    if not IFIND_SETTINGS_LOCK.acquire(blocking=False):
+        raise RuntimeError('已有 iFinD 连接测试，请稍后重试')
+    try:
+        checks = []
+        for label, symbol in (('A 股', 'sh600519'), ('场内 ETF', 'sh510300')):
+            failures = []
+            quote = load_ifind_quotes([symbol], failures, token=token).get(symbol)
+            checks.append({'market': label, 'symbol': symbol[2:], 'ok': bool(quote),
+                           **({'timestamp': quote['timestamp'], 'price': quote['price']} if quote else
+                              {'error': '；'.join(failures) or '未返回可核验的证券代码、报价时间或价格'})})
+        passed = sum(check['ok'] for check in checks)
+        saved = False
+        save_error = None
+        if passed and has_new_key:
+            try:
+                save_ifind_settings(token)
+                saved = True
+            except OSError:
+                save_error = '报价测试通过，但本机无法写入密钥设置，请检查权限后重试'
+        return {'result': ('ok' if passed == len(checks) else 'partial') if passed else 'failed',
+                'checked_at': now(), 'checks': checks, 'saved': saved, 'save_error': save_error,
+                **ifind_connection_status()}
+    finally:
+        IFIND_SETTINGS_LOCK.release()
+
+
+def canonical_quote_name(quote, expected):
+    name = quote.get('name')
+    if not expected or name == expected:
+        return quote
+    marker = re.fullmatch(r'(?:XD|XR|DR)\s*(.+)', name or '')
+    if marker:
+        short = marker[1]
+        # On ex-dates the prefix can occupy two bytes of the vendor name field.
+        if short == expected or (re.fullmatch(r'[\u3400-\u9fff]{3}', short) and expected.startswith(short)):
+            return {**quote, 'name': expected, 'provider_name': name}
+    if quote.get('qualified_code'):
+        return {**quote, 'name': expected, 'provider_name': name}
+    return quote
+
+
+def load_cn_quotes(symbols, *, issues=None, minimum=None, require_bar=False):
+    remaining = dict.fromkeys(symbols)
+    minimum = minimum or {}
+    quotes, errors, price_only = {}, {}, {}
+    sources = [('腾讯报价', lambda pending, _: parse_quotes(fetch(QUOTE + ','.join(pending)))),
+               ('新浪报价', lambda pending, _: parse_sina_quotes(fetch(SINA_QUOTE + ','.join(pending)))),
+               ('同花顺 iFinD 报价', load_ifind_quotes)]
+    for name, load in sources:
+        if not remaining:
+            break
+        failures = []
+        invalid_identity = invalid_time = 0
+        try:
+            result = load(list(remaining), failures)
+            for symbol in list(remaining):
+                quote = result.get(symbol)
+                floor = minimum.get(symbol, {})
+                stamp = quote.get('timestamp', '') if quote else ''
+                if not quote:
+                    continue
+                quote = canonical_quote_name(quote, floor.get('name'))
+                if (quote.get('code') != symbol[2:] or not quote.get('name')
+                        or floor.get('name') and quote['name'] != floor['name']):
+                    invalid_identity += 1
+                    continue
+                if not stamp or stamp < (floor.get('timestamp') or '') or stamp > now():
+                    invalid_time += 1
+                    continue
+                if require_bar and quote_bar_error(quote):
+                    if stamp >= price_only.get(symbol, {}).get('timestamp', ''):
+                        price_only[symbol] = quote
+                    continue
+                quotes[symbol] = quote
+                remaining.pop(symbol)
+            if remaining:
+                missing = '、'.join(list(remaining)[:10])
+                kind = '完整累计 OHLC/成交量' if require_bar else '有效报价'
+                failures.append(f'{len(remaining)} 个标的缺少{kind}（{missing}）')
+            if invalid_identity:
+                failures.append(f'{invalid_identity} 个标的证券身份不匹配')
+            if invalid_time:
+                failures.append(f'{invalid_time} 个标的报价时间缺失、过旧或晚于当前时间')
         except (OSError, ValueError) as exc:
-            errors.append(f'{name}报价：{str(exc)[:165]}')
-    raise ConnectionError('；'.join(errors))
+            failures.append(str(exc)[:165])
+        if failures:
+            errors[name] = '；'.join(failures)
+    if issues is not None:
+        issues.update(errors)
+    quotes.update({s: price_only[s] for s in remaining if s in price_only})
+    if not quotes and remaining:
+        raise ConnectionError('；'.join(f'{name}：{error}' for name, error in errors.items()))
+    return quotes
 
 
 def parse_sina(raw):
@@ -258,16 +591,24 @@ def load_asset(asset, quotes, previous=None):
     raise ValueError('；'.join(errors))
 
 
-def patch_quote(record, quote):
-    """Apply the current cumulative OHLC only after history has been refreshed."""
+def quote_bar_error(quote):
     stamp = dt.datetime.fromisoformat(quote['timestamp'])
     if stamp.time() < dt.time(9, 30) and not all((quote.get(k) or 0) > 0 for k in ('open', 'high', 'low')):
-        raise ValueError('开盘前尚未形成有效日K，未采用竞价指示价')
+        return '开盘前尚未形成有效日K，未采用竞价指示价'
     keys = ['open', 'high', 'low', 'price', 'volume']
     if not all(isinstance(quote.get(k), (int, float)) and math.isfinite(quote[k]) for k in keys):
-        raise ValueError('最新报价缺少完整OHLC/累计量')
+        return '最新报价缺少完整OHLC/累计量'
     if min(quote[k] for k in keys[:4]) <= 0 or quote['volume'] < 0 or quote['low'] > min(quote['open'], quote['price']) or quote['high'] < max(quote['open'], quote['price']):
-        raise ValueError('最新报价OHLC不一致')
+        return '最新报价OHLC不一致'
+    return None
+
+
+def patch_quote(record, quote):
+    """Apply the current cumulative OHLC only after history has been refreshed."""
+    issue = quote_bar_error(quote)
+    if issue:
+        raise ValueError(quote.get('source', '报价源') + '：' + issue)
+    stamp = dt.datetime.fromisoformat(quote['timestamp'])
     initial = record['latest_quote']
     if (quote['code'], quote.get('name')) != (initial['code'], initial['name']):
         raise ValueError('二次报价名称或代码未通过核验')
@@ -289,12 +630,15 @@ def patch_quote(record, quote):
                   closed_as_of=max((b['date'] for b in record['bars'] if b.get('completed')), default=None))
 
 
-def retain_valid_history(record, reason):
+def retain_valid_history(record, reason, quote=None):
     last = record['bars'][-1]
     record['live_error'] = str(reason)[:200]
     record['latest_quote'] = {'code': record['latest_quote']['code'], 'name': record['latest_quote']['name'],
                               'price': last['close'], 'date': last['date'], 'timestamp': last['date'],
                               'source': '最新有效历史日线；实时补丁未采用', 'turnover': None}
+    if (quote and quote.get('source') == '同花顺 iFinD Level 1' and quote.get('date', '') >= last['date']
+            and (quote['code'], quote['name']) == (record['latest_quote']['code'], record['latest_quote']['name'])):
+        record['latest_quote'] = {**quote, 'quote_only': True}
     record['closed_as_of'] = max((b['date'] for b in record['bars'] if b.get('completed')), default=None)
 
 
@@ -778,8 +1122,9 @@ def load_geopolitics():
 
 
 # Market-qualified IDs prevent collisions such as HK.00700 versus US.00700.
-BASE_WATCH_CODES = {'002281', '601869', '688825', '688981', '300033', '300390', '515980', '588080'}
 BENCHMARK_CODES = {'510300', '159338', '510500', '512100', '159915', '588080'}
+BASE_WATCH_CODES = {'002281', '601869', '688825', '688981', '300033', '300390', '515980'} | BENCHMARK_CODES
+WATCHLIST_DEFAULTS_VERSION = 1
 RISK_WEIGHTS = {'DXY': 6, 'CNH': 5, 'US10Y': 4, 'DJI': 2, 'IXIC': 8, 'N225': 2, 'KOSPI': 2,
                 'SOX': 12, 'usSOXX': 10, 'usQQQ': 14, 'hkHSTECH': 5, 'A50': 3, 'GOLD': 2, 'SILVER': 1, 'BTC': 4}
 SEARCH_CACHE, SEARCH_LOCK = {}, threading.Lock()
@@ -956,8 +1301,11 @@ def parse_international_chart(result, identity, current=None):
 def load_international_asset(meta, previous=None):
     ticker = yahoo_symbol(meta)
     url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker, safe='') + '?range=5y&interval=1d&includePrePost=false'
-    result = json_get(url)['chart']['result'][0]
-    record = parse_international_chart(result, meta)
+    try:
+        result = json_get(url)['chart']['result'][0]
+        record = parse_international_chart(result, meta)
+    except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
+        raise ValueError(f'Yahoo Finance 港美股日线：{str(exc)[:160]}') from exc
     record['provider_url'] = url
     prior_dates = [b['date'] for b in record['bars'] if b['completed']]
     # Re-fetching all daily bars repairs the last previously-provisional trading session.
@@ -980,16 +1328,18 @@ def load_watch_record(meta, previous=None, quotes=None):
         return load_international_asset(meta, previous)
     symbol = meta['provider_symbol']
     SYMBOLS[meta['code']] = symbol
-    quotes = quotes if quotes is not None else load_cn_quotes([symbol])
+    quotes = quotes if quotes is not None else load_cn_quotes([symbol], minimum={symbol: meta})
     code, record = load_asset((meta['code'], meta['name'], meta.get('listed')), quotes)
     target = max((b['date'] for b in record['bars'] if b['date'] < quotes[symbol]['date']), default=None)
     if target:
         verify_previous(record, previous, target)
+    fresh_quote = None
     try:
-        patch_quote(record, load_cn_quotes([symbol])[symbol])
+        fresh_quote = load_cn_quotes([symbol], minimum=quotes, require_bar=True)[symbol]
+        patch_quote(record, fresh_quote)
     except Exception as exc:
         # Bad or unavailable live OHLC must not erase independently validated daily history.
-        retain_valid_history(record, exc)
+        retain_valid_history(record, exc, fresh_quote)
     record.update(market='CN', currency='CNY')
     return code, record
 
@@ -1126,6 +1476,7 @@ class DataStore:
         self.registry_activated = False
         self.data_revision = 0
         self.state = {'busy': False, 'done': 0, 'total': len(ASSETS), 'stage': 'idle', 'errors': {}, 'last_refresh': None,
+                      'price_result': None, 'quote_sources': {},
                       'cache_path': str(self.cache), 'cache_warning': None, 'cache_persisted': False}
         self.snapshot = {'data_kind': 'local', 'instruments': {}, 'as_of': None}
         # A previous run may have switched directories. Resume its newest valid cache.
@@ -1165,6 +1516,13 @@ class DataStore:
         cached = self.snapshot.get('screening_cache')
         if isinstance(cached, dict):
             self.screening_cache = {k:v for k,v in list(cached.items())[-200:] if isinstance(v, dict)}
+        if self.registry_activated and not self.snapshot.get('watchlist_defaults_version'):
+            missing = BENCHMARK_CODES - {code for code in BENCHMARK_CODES if self.catalog[code]['watch']}
+            for code in missing:
+                self.catalog[code]['watch'] = True
+            if missing:
+                self.watchlist_revision += 1
+            self.commit_snapshot(self.snapshot)
 
     def catalog_view(self):
         return [dict(x) for x in self.catalog.values()]
@@ -1377,12 +1735,20 @@ class DataStore:
         with self.lock:
             if self.state['busy']:
                 return False
-            self.state.update(busy=True, done=0, total=sum(bool(m.get('watch') or m.get('benchmark')) for m in self.catalog.values()), errors={}, started_at=now())
-        threading.Thread(target=self.refresh, daemon=True).start()
+            self.state.update(busy=True, done=0, total=sum(bool(m.get('watch') or m.get('benchmark')) for m in self.catalog.values()),
+                              errors={}, quote_sources={}, price_result=None, stage='准备刷新', started_at=now())
+        try:
+            threading.Thread(target=self.refresh, daemon=True).start()
+        except RuntimeError:
+            with self.lock:
+                self.state.update(busy=False, stage='刷新任务未启动', price_result='failed',
+                                  errors={'刷新服务': '无法启动后台刷新任务'}, last_refresh=now())
+            raise
         return True
 
     def refresh(self):
-        instruments, errors = {}, {}
+        instruments, errors, quote_only, quote_sources = {}, {}, {}, {}
+        prices_published = False
         try:
             with self.lock:
                 previous = json.loads(json.dumps(self.snapshot))
@@ -1391,13 +1757,18 @@ class DataStore:
             cn_active = [m for m in active if m['market'] == 'CN']
             cn_assets = [(m['code'], m['name'], m.get('listed')) for m in cn_active]
             quote_symbols = [m['provider_symbol'] for m in cn_active] + [SYMBOLS[a[0]] for a in SECTOR_ASSETS]
+            quote_minimum = {m['provider_symbol']: {
+                'name': m['name'],
+                'timestamp': previous.get('instruments', {}).get(m['code'], {}).get('latest_quote', {}).get('timestamp'),
+            } for m in cn_active}
+            quote_sources['初始报价'] = {}
             try:
-                quotes = load_cn_quotes(quote_symbols)
+                quotes = load_cn_quotes(quote_symbols, issues=quote_sources['初始报价'], minimum=quote_minimum)
             except OSError as exc:
                 errors['A股初始报价'] = str(exc)
-                with self.lock:
-                    self.state['errors'] = dict(errors)
                 quotes = {}
+            with self.lock:
+                self.state.update(errors=dict(errors), quote_sources={'初始报价': dict(quote_sources['初始报价'])})
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                 futures = {pool.submit(load_asset, a, quotes): a[0] for a in cn_assets} if quotes else {}
                 futures.update({pool.submit(load_international_asset, m, previous.get('instruments', {}).get(m['code'])): m['code'] for m in active if m['market'] != 'CN'})
@@ -1408,6 +1779,13 @@ class DataStore:
                         instruments[key] = record
                     except Exception as exc:
                         errors[code] = str(exc)[:400]
+                        old = previous.get('instruments', {}).get(code, {})
+                        quote = quotes.get(SYMBOLS.get(code))
+                        if (old.get('bars') and quote and quote.get('name') == self.catalog[code]['name']
+                                and quote['timestamp'] > (old.get('latest_quote', {}).get('timestamp') or '')
+                                and quote['date'] >= old.get('as_of', '')):
+                            quote_only[code] = {**old, 'latest_quote': {**quote, 'quote_only': True},
+                                                'live_error': errors[code]}
                     with self.lock:
                         self.state['done'] += 1
             reference = instruments.get('510300') or next((instruments[a[0]] for a in cn_assets if a[0] in instruments), None)
@@ -1421,22 +1799,27 @@ class DataStore:
                 self.state['stage'] = '更新当天实时日K'
             fresh_quotes, live_error = {}, None
             if quotes:
+                quote_sources['二次报价'] = {}
                 try:
-                    fresh_quotes = load_cn_quotes(quote_symbols)
+                    fresh_quotes = load_cn_quotes(quote_symbols, issues=quote_sources['二次报价'],
+                                                  minimum={**quote_minimum, **quotes}, require_bar=True)
                 except OSError as exc:
                     live_error = str(exc)
                     errors['A股二次报价'] = live_error
-                    with self.lock:
-                        self.state['errors'] = dict(errors)
+            with self.lock:
+                self.state.update(errors=dict(errors), quote_sources={phase: dict(issues) for phase, issues in quote_sources.items()})
             for code, record in instruments.items():
                 if self.catalog[code]['market'] != 'CN':
                     continue
+                quote = fresh_quotes.get(SYMBOLS[code])
                 try:
                     if live_error:
                         raise ConnectionError(live_error)
-                    patch_quote(record, fresh_quotes[SYMBOLS[code]])
+                    if not quote:
+                        raise ValueError('全部报价源均未返回该标的有效报价，详见行情源尝试')
+                    patch_quote(record, quote)
                 except Exception as exc:
-                    retain_valid_history(record, exc)
+                    retain_valid_history(record, exc, quote)
                     if not live_error:
                         errors[code + ':live'] = str(exc)[:200]
                 old = previous.get('instruments', {}).get(code, {})
@@ -1445,14 +1828,17 @@ class DataStore:
                         record[key] = old[key]
             # Publish a detached price snapshot before slower research requests finish.
             # Charts can update immediately while all research keeps its own timestamps.
-            if instruments:
-                interim = {'schema_version': 4, 'data_kind': 'local', 'as_of': max(r['as_of'] for r in instruments.values()),
-                           'closed_as_of': min(r.get('closed_as_of') or r['as_of'] for r in instruments.values()),
-                           'previous_session': previous_session, 'fetched_at': now(), 'instruments': instruments, 'catalog': self.catalog_view(),
+            price_records = {**instruments, **quote_only}
+            if price_records:
+                interim = {'schema_version': 4, 'data_kind': 'local', 'as_of': max(r['as_of'] for r in price_records.values()),
+                           'closed_as_of': min(r.get('closed_as_of') or r['as_of'] for r in price_records.values()),
+                           'previous_session': previous_session, 'fetched_at': now(), 'instruments': price_records, 'catalog': self.catalog_view(),
                            'external': previous.get('external', []), 'geopolitics': previous.get('geopolitics', {}), 'sectors': previous.get('sectors', []), 'errors': errors}
                 self.commit_snapshot(json.loads(json.dumps(interim)))
+                prices_published = True
             with self.lock:
-                self.state['stage'] = '补充财务、公告与产业证据'
+                self.state.update(stage='可用行情已更新，正在补充研究数据' if prices_published else '补充财务、公告与产业证据',
+                                  errors=dict(errors))
 
             def research(asset):
                 code, expected, _ = asset
@@ -1538,9 +1924,12 @@ class DataStore:
             try:
                 external = load_external()
                 has_external_update = any(r.get('price') is not None and not r.get('error') for r in external)
+                for row in external:
+                    if row.get('error'):
+                        errors['外围:' + row['symbol']] = (row.get('source') or 'Yahoo Finance') + '：' + row['error']
             except Exception as exc:
                 external = previous.get('external', [])
-                errors['external'] = str(exc)[:180]
+                errors['外围行情'] = 'Yahoo Finance 等外围行情源：' + str(exc)[:180]
             external = merge_external(previous.get('external', []), external)
             try:
                 geopolitics = load_geopolitics()
@@ -1560,15 +1949,21 @@ class DataStore:
                         'as_of': max((r['as_of'] for r in instruments.values()), default=None),
                         'closed_as_of': min((r.get('closed_as_of') or r['as_of'] for r in instruments.values()), default=None),
                         'fetched_at': now(), 'previous_session': previous_session, 'external': external, 'geopolitics': geopolitics, 'sectors': list(sectors.values()),
-                        'instruments': instruments, 'catalog': self.catalog_view(), 'errors': errors}
+                        'instruments': price_records, 'catalog': self.catalog_view(), 'errors': errors}
             # Keep the previous snapshot timestamp when no price observations were retrieved.
-            if instruments or has_external_update:
+            if price_records or has_external_update:
                 self.commit_snapshot(snapshot)
+                prices_published = True
         except Exception as exc:
-            errors['provider'] = str(exc)[:400]
+            errors['刷新任务'] = f'{type(exc).__name__}：{str(exc)[:380]}'
         finally:
             with self.lock:
-                self.state.update(busy=False, stage='完成', errors=errors, last_refresh=now())
+                if not prices_published and not errors:
+                    errors['刷新任务'] = '各行情源未返回可发布的价格'
+                price_errors = any(key != 'geopolitics' for key in errors)
+                result = ('partial' if price_errors else 'ok') if prices_published else 'failed'
+                self.state.update(busy=False, stage='完成', errors=errors, quote_sources=quote_sources,
+                                  price_result=result, last_refresh=now())
 
     def commit_snapshot(self, snapshot):
         with self.commit_lock:
@@ -1582,6 +1977,10 @@ class DataStore:
                         if code not in enabled:
                             continue
                         old = records.get(code, {})
+                        if record.get('latest_quote', {}).get('quote_only') and (
+                                str(record['latest_quote'].get('timestamp') or '') <
+                                str(old.get('latest_quote', {}).get('timestamp') or '')):
+                            continue
                         if old.get('as_of') == record.get('as_of') and old.get('bars') and record.get('bars'):
                             old_bar, new_bar = old['bars'][-1], record['bars'][-1]
                             if ((old_bar.get('completed') is True and new_bar.get('completed') is False)
@@ -1592,7 +1991,8 @@ class DataStore:
                                 and str(record.get('history_checked_at') or '') >= str(old.get('history_checked_at') or '')):
                             records[code] = record
                     self.data_revision += 1
-                    snapshot = {**snapshot, 'instruments': records, 'catalog': self.catalog_view(), 'watchlist_revision': self.watchlist_revision, 'data_revision': self.data_revision}
+                    snapshot = {**snapshot, 'instruments': records, 'catalog': self.catalog_view(), 'watchlist_revision': self.watchlist_revision,
+                                'watchlist_defaults_version': WATCHLIST_DEFAULTS_VERSION, 'data_revision': self.data_revision}
                     snapshot['screening_cache'] = self.screening_cache
                     snapshot['as_of'] = max((r.get('as_of') for r in records.values() if r.get('as_of')), default=None)
                 self.snapshot = snapshot
@@ -1649,8 +2049,43 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def is_page_request(self):
+        site = self.headers.get('Sec-Fetch-Site')
+        if site not in (None, 'same-origin'):
+            return False
+        origin = self.headers.get('Origin')
+        if origin is None:
+            return True
+        try:
+            url = urllib.parse.urlsplit(origin)
+            if (url.scheme not in ('http', 'https') or not url.hostname or url.username is not None
+                    or url.path or url.query or url.fragment):
+                return False
+        except ValueError:
+            return False
+        # Some reverse proxies rewrite Host after the browser has verified same origin.
+        return site == 'same-origin' or url.netloc.lower() == self.headers.get('Host', '').lower()
+
+    def is_private_settings_page(self):
+        host = self.headers.get('Host', '').lower()
+        try:
+            address = urllib.parse.urlsplit('//' + host)
+            if (address.netloc != host or address.username is not None or not address.hostname
+                    or (address.port or 80) != self.server.server_port):
+                return False
+            host_is_loopback = address.hostname == 'localhost' or ipaddress.ip_address(address.hostname).is_loopback
+            return (host_is_loopback and ipaddress.ip_address(self.client_address[0]).is_loopback
+                    and ipaddress.ip_address(self.server.server_address[0]).is_loopback
+                    and self.headers.get('Origin') in (None, 'http://' + host))
+        except ValueError:
+            return False
+
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path == '/api/session':
+            if not self.is_page_request():
+                return self.send({'error': '仅允许当前页面发起操作'}, status=403)
+            return self.send({'token': TOKEN})
         if path == '/api/screening':
             job_id = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('id', [''])[0]
             with self.server.store.lock:
@@ -1671,6 +2106,7 @@ class Handler(BaseHTTPRequestHandler):
                           'as_of': self.server.store.snapshot.get('as_of'),
                           'closed_as_of': self.server.store.snapshot.get('closed_as_of'),
                           'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server', 'data_revision': self.server.store.data_revision, 'watchlist_revision': self.server.store.watchlist_revision, 'asset_jobs': dict(self.server.store.asset_jobs)}
+            result['ifind'] = {'available': True, **ifind_connection_status()} if self.is_private_settings_page() else {'available': False}
             return self.send(result)
         if path == '/api/snapshot':
             with self.server.store.lock:
@@ -1695,14 +2131,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send(text.encode(), kind + '; charset=utf-8')
 
     def do_POST(self):
-        if self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start'):
+        if self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start', '/api/ifind/test'):
             return self.send({'error': 'Not found'}, status=404)
-        origin = self.headers.get('Origin')
-        host = self.headers.get('Host', '')
-        if self.headers.get('X-RiskLens-Token') != TOKEN or (origin and urllib.parse.urlsplit(origin).netloc != host):
+        if not self.is_page_request():
             return self.send({'error': '仅允许当前页面发起操作'}, status=403)
+        if self.path == '/api/ifind/test' and not self.is_private_settings_page():
+            return self.send({'error': '请在运行服务的电脑上通过本地地址打开工作台，再配置 iFinD 密钥'}, status=403)
+        if not secrets.compare_digest(self.headers.get('X-RiskLens-Token', '').encode('utf-8'), TOKEN.encode('ascii')):
+            return self.send({'error': '页面会话已失效，请刷新页面后重试', 'code': 'stale_session'}, status=403)
         if self.path == '/api/refresh':
-            started = self.server.store.start()
+            try:
+                started = self.server.store.start()
+            except RuntimeError:
+                return self.send({'error': '本地服务无法启动后台刷新任务，请重启后重试'}, status=503)
             return self.send({'started': started}, status=202 if started else 200)
         try:
             length = int(self.headers.get('Content-Length', 0))
@@ -1711,6 +2152,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError('需要JSON对象')
+            if self.path == '/api/ifind/test':
+                return self.send(test_ifind_connection(payload))
             store = self.server.store
             if self.path == '/api/screening/start':
                 return self.send({'id': store.start_screening(payload)}, status=202)
@@ -1727,6 +2170,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError) as exc:
             return self.send({'error': str(exc)}, status=400)
         except Exception as exc:
+            if self.path == '/api/ifind/test':
+                return self.send({'error': 'iFinD 测试未完成，请检查本机连接后重试'}, status=502)
             return self.send({'error': str(exc)[:300]}, status=502)
 
 

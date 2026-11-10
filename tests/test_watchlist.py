@@ -61,6 +61,28 @@ class WatchlistTests(unittest.TestCase):
             stale=json.loads(json.dumps(store.snapshot));store.remove_watch('US.NVDA',0);store.remove_watch('588080',1);store.commit_snapshot(stale)
             self.assertNotIn('US.NVDA',store.snapshot['instruments']);self.assertIn('588080',store.snapshot['instruments'])
             self.assertTrue(store.catalog['588080']['benchmark']);self.assertFalse(store.catalog['588080']['watch'])
+    def test_existing_watchlist_adds_all_benchmarks_once_and_preserves_custom_choices(self):
+        with tempfile.TemporaryDirectory() as folder:
+            p=Path(folder)/'cache.json'
+            catalog=app.base_catalog()
+            catalog['US.NVDA']=META.copy()
+            catalog['002281']['watch']=False
+            for code in app.BENCHMARK_CODES:
+                catalog[code]['watch']=code=='588080'
+            fetched_at='2026-10-30T15:30:00+08:00'
+            p.write_text(json.dumps({'data_kind':'local','catalog':list(catalog.values()),'instruments':{},
+                                     'watchlist_revision':7,'fetched_at':fetched_at}))
+            migrated=self.store(p)
+            self.assertTrue(all(migrated.catalog[c]['watch'] for c in app.BENCHMARK_CODES))
+            self.assertTrue(migrated.catalog['US.NVDA']['watch'])
+            self.assertFalse(migrated.catalog['002281']['watch'])
+            self.assertEqual(migrated.watchlist_revision,8)
+            self.assertEqual(migrated.snapshot['fetched_at'],fetched_at)
+            migrated.remove_watch('510300',8)
+            restored=self.store(p)
+            self.assertFalse(restored.catalog['510300']['watch'])
+            self.assertTrue(restored.catalog['510300']['benchmark'])
+            self.assertEqual(restored.watchlist_revision,9)
     def test_concurrent_snapshot_merge_preserves_newer_asset(self):
         with tempfile.TemporaryDirectory() as folder:
             store=self.store(Path(folder)/'cache.json');store.catalog['US.NVDA']=META.copy()

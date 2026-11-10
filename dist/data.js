@@ -16,14 +16,14 @@ const CATALOG=[
  {code:'300390',name:'天华新能',type:'stock',industry:'锂电材料',watch:true,base:22.8,topic:'锂电材料 / 资源周期',questions:['锂价与库存周期是否企稳？','经营现金流与盈利改善是否一致？','周期低基数是否放大表观增速？']},
  {code:'515980',name:'人工智能ETF华富',type:'etf',industry:'人工智能主题',watch:true,base:.866,topic:'人工智能',source:IDENTITY_SOURCES.ai,questions:['成分集中度与行业交叉暴露如何？','成分盈利与主题估值是否匹配？','份额申赎、折溢价与跟踪误差如何？']},
  {code:'588080',name:'科创50ETF易方达',shortName:'科创50ETF',type:'etf',industry:'科创宽基',watch:true,benchmark:true,base:1.414,topic:'科创50',manager:'易方达',source:IDENTITY_SOURCES.efund,questions:['成分结构与盈利质量如何变化？','成分估值和行业集中度是否上升？','份额变化与价格走势是否一致？']},
- {code:'510300',name:'沪深300ETF华泰柏瑞',shortName:'沪深300ETF',type:'etf',industry:'大盘宽基',benchmark:true,base:4.25,topic:'沪深300',manager:'华泰柏瑞'},
- {code:'159338',name:'中证A500ETF国泰',shortName:'A500ETF',type:'etf',industry:'全市场宽基',benchmark:true,base:1.12,topic:'中证A500',manager:'国泰',source:IDENTITY_SOURCES.a500},
- {code:'510500',name:'中证500ETF南方',shortName:'中证500ETF',type:'etf',industry:'中盘宽基',benchmark:true,base:6.8,topic:'中证500',manager:'南方'},
- {code:'512100',name:'中证1000ETF南方',shortName:'中证1000ETF',type:'etf',industry:'小盘宽基',benchmark:true,base:2.34,topic:'中证1000',manager:'南方',source:IDENTITY_SOURCES.n1000},
- {code:'159915',name:'创业板ETF易方达',shortName:'创业板ETF',type:'etf',industry:'成长宽基',benchmark:true,base:2.55,topic:'创业板',manager:'易方达',source:IDENTITY_SOURCES.efund}
+ {code:'510300',name:'沪深300ETF华泰柏瑞',shortName:'沪深300ETF',type:'etf',industry:'大盘宽基',watch:true,benchmark:true,base:4.25,topic:'沪深300',manager:'华泰柏瑞'},
+ {code:'159338',name:'中证A500ETF国泰',shortName:'A500ETF',type:'etf',industry:'全市场宽基',watch:true,benchmark:true,base:1.12,topic:'中证A500',manager:'国泰',source:IDENTITY_SOURCES.a500},
+ {code:'510500',name:'中证500ETF南方',shortName:'中证500ETF',type:'etf',industry:'中盘宽基',watch:true,benchmark:true,base:6.8,topic:'中证500',manager:'南方'},
+ {code:'512100',name:'中证1000ETF南方',shortName:'中证1000ETF',type:'etf',industry:'小盘宽基',watch:true,benchmark:true,base:2.34,topic:'中证1000',manager:'南方',source:IDENTITY_SOURCES.n1000},
+ {code:'159915',name:'创业板ETF易方达',shortName:'创业板ETF',type:'etf',industry:'成长宽基',watch:true,benchmark:true,base:2.55,topic:'创业板',manager:'易方达',source:IDENTITY_SOURCES.efund}
 ];
 const BENCH_CODES=['510300','159338','510500','512100','159915','588080'];
-const WATCH_CODES=['002281','601869','688825','688981','300033','300390','515980','588080'];
+const WATCH_CODES=CATALOG.filter(asset=>asset.watch).map(asset=>asset.code);
 const SKILL_MAP=[
  {name:'市场情绪偏离分析',id:'market-sentiment-gap',version:'安装版',pages:'情绪偏离 / 七维情绪',detail:'负面情绪、财务健康、竞争力、问题性质、催化剂与反证。',url:'https://chatgpt.com/skills?skill_id=6ae415e62d6481919824b65893ebcd7c'},
  {name:'科技炒作与基本面',id:'tech-hype-fundamentals',version:'安装版',pages:'估值与基本面 / 七维估值',detail:'企业阶段、估值口径、盈利质量、现金流、研发与概念收入兑现。',url:'https://chatgpt.com/skills?skill_id=6ae416045a888191ae42d64503e3fc4a'},
