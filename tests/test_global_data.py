@@ -58,9 +58,12 @@ class GlobalDataTests(unittest.TestCase):
                 app.parse_gpr_stata(raw)
 
     def test_one_quote_does_not_manufacture_250_day_history(self):
-        payload = {'chart': {'result': [{'meta': {'symbol': 'SOXX'}, 'timestamp': [1793318400], 'indicators': {'quote': [{'close': [100]}]}}]}}
-        with patch.object(app, 'fetch', return_value=json.dumps(payload).encode()):
+        payload = {'status': 'DELAYED', 'ticker': 'SOXX', 'results': [{'t': 1793318400000, 'c': 100}]}
+        with patch.object(app, 'massive_json', return_value=payload), patch.object(app, 'fetch') as public:
             row = app.load_global_asset(next(r for r in app.GLOBAL_ASSETS if r[0] == 'usSOXX'))
+        public.assert_not_called()
+        self.assertEqual(row['provider'], 'Massive')
+        self.assertIn('延迟', row['source'])
         self.assertEqual(len(row['history']), 1)
         self.assertIsNone(row['returns']['60']['value'])
         self.assertIsNone(row['returns']['250']['value'])
@@ -68,13 +71,51 @@ class GlobalDataTests(unittest.TestCase):
     def test_a50_fallback_is_the_exact_index_and_has_enough_history(self):
         quote = {'chart': {'result': [{'meta': {'symbol': 'XIN9.FGI'}, 'timestamp': [], 'indicators': {'quote': [{'close': []}]}}]}}
         dates = [(app.dt.date(2025, 10, 1)+app.dt.timedelta(days=i)).isoformat() for i in range(251)]
-        history = {'data': {'code': 'XIN9', 'klines': [f'{d},100,{100+i},400,90,0,0' for i, d in enumerate(dates)]}}
-        with patch.object(app, 'fetch', side_effect=[json.dumps(quote).encode(), json.dumps(history).encode()]):
+        history = {'data': {'code': 'XIN9', 'market': 100, 'klines': [f'{d},100,{100+i},400,90,0,0' for i, d in enumerate(dates)]}}
+        empty = json.dumps(quote).encode()
+        with patch.object(app, 'fetch', side_effect=[empty, empty, json.dumps(history).encode()]):
             row = app.load_global_asset(next(r for r in app.GLOBAL_ASSETS if r[0] == 'A50'))
         self.assertEqual(len(row['history']), 251)
         self.assertEqual(row['returns']['250']['value'], 250.)
         self.assertIn('100.XIN9', row['history_url'])
         self.assertNotIn('CN00Y', row['history_url'])
+
+    def test_yahoo_403_tries_the_second_chart_host(self):
+        asset = next(r for r in app.GLOBAL_ASSETS if r[0] == 'DJI')
+        blocked = app.urllib.error.HTTPError('https://query1.finance.yahoo.com', 403, 'Forbidden', None, None)
+        payload = {'chart': {'result': [{'meta': {'symbol': '^DJI'}, 'timestamp': [1793318400],
+                                        'indicators': {'quote': [{'close': [100]}]}}]}}
+        with patch.object(app, 'fetch', side_effect=[blocked, json.dumps(payload).encode()]) as fetch:
+            row = app.load_global_asset(asset)
+        self.assertEqual(row['provider'], 'Yahoo Finance')
+        self.assertIn('query2.finance.yahoo.com', fetch.call_args.args[0])
+        self.assertIn('403', row['fallback_errors'][0])
+        self.assertNotIn('error', row)
+
+    def test_both_yahoo_hosts_403_fall_back_to_the_exact_provider_market(self):
+        asset = next(r for r in app.GLOBAL_ASSETS if r[0] == 'DJI')
+        blocked = app.urllib.error.HTTPError('https://finance.yahoo.com', 403, 'Forbidden', None, None)
+        for market, expected in ((100, '东方财富'), (106, None)):
+            payload = {'data': {'code': 'DJIA', 'market': market, 'klines': ['2026-10-30,101,102,103,100,0,0']}}
+            with patch.object(app, 'fetch', side_effect=[blocked, blocked, json.dumps(payload).encode()]):
+                row = app.load_global_asset(asset)
+            self.assertEqual(row.get('provider'), expected)
+            if expected:
+                self.assertEqual(row['price'], 102)
+                self.assertEqual(len(row['fallback_errors']), 2)
+            else:
+                self.assertIn('跨市场历史标的身份不匹配', row['error'])
+
+    def test_new_provider_history_is_not_blended_with_the_old_provider(self):
+        old = {'symbol': 'GOLD', 'ticker': 'GC=F', 'kind': 'metal', 'provider': 'Yahoo Finance',
+               'history_as_of': '2026-10-30', 'history': [{'date': '2026-10-29', 'close': 90}, {'date': '2026-10-30', 'close': 95}]}
+        fresh = {'symbol': 'GOLD', 'ticker': 'GC=F', 'kind': 'metal', 'provider': '东方财富',
+                 'history_as_of': '2026-10-30', 'history': [{'date': '2026-10-30', 'close': 100}]}
+        self.assertEqual(app.merge_external([old], [fresh]), [fresh])
+        stale = {**fresh, 'history_as_of': '2026-10-29'}
+        retained = app.merge_external([old], [stale])[0]
+        self.assertTrue(retained['retained'])
+        self.assertEqual(retained['provider'], 'Yahoo Finance')
 
     def test_sox_is_the_index_while_soxx_remains_the_separate_etf(self):
         sox = next(r for r in app.GLOBAL_ASSETS if r[0] == 'SOX')
@@ -83,6 +124,25 @@ class GlobalDataTests(unittest.TestCase):
         self.assertEqual(sox[3], '点')
         self.assertEqual(soxx[2], 'SOXX')
         self.assertEqual(sox[-1] + soxx[-1], 22)
+        current = app.dt.datetime.fromisoformat('2026-11-10T03:00:00+00:00')
+        for ticker, expected_date, completed in (('I:SOX', '2026-11-09', False),
+                                                  ('X:BTCUSD', '2026-11-10', False)):
+            stamp = current - app.dt.timedelta(hours=1)
+            payload = {'status': 'DELAYED', 'ticker': ticker, 'results': [{'t': int(stamp.timestamp() * 1000), 'c': 100}]}
+            with patch.object(app, 'massive_json', return_value=payload):
+                rows, url, _, _ = app.massive_daily(ticker, current=current)
+            self.assertIn('/ticker/' + ticker + '/', url)
+            self.assertEqual((rows[-1]['date'], rows[-1]['completed']), (expected_date, completed))
+
+    def test_massive_sox_denial_uses_the_exact_nasdaq_index(self):
+        sox = next(r for r in app.GLOBAL_ASSETS if r[0] == 'SOX')
+        payload = {'data': {'symbol': 'SOX', 'tradesTable': {'rows': [{'date': '10/30/2026', 'close': '10,100.24'}]}}}
+        with patch.object(app, 'massive_json', side_effect=ValueError('Massive HTTP 403')) as massive, \
+             patch.object(app, 'fetch', return_value=json.dumps(payload).encode()) as public:
+            row = app.load_global_asset(sox)
+        self.assertIn('/ticker/I:SOX/', massive.call_args.args[0])
+        self.assertIn('api.nasdaq.com', public.call_args.args[0])
+        self.assertEqual((row['provider'], row['price'], row['fallback_errors']), ('Nasdaq', 10100.24, ['Massive HTTP 403']))
 
     def test_wrong_ticker_identity_cannot_be_used(self):
         with patch.object(app, 'fetch', return_value=b'{"chart":{"result":[{"meta":{"symbol":"WRONG"}}]}}'):

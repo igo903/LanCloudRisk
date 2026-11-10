@@ -44,6 +44,23 @@ class WatchlistTests(unittest.TestCase):
         with self.assertRaises(ValueError):app.parse_international_chart(f,META)
         f=fixture();f['indicators']['quote'][0]['high']=[1,1]
         with self.assertRaises(ValueError):app.parse_international_chart(f,META)
+    def test_massive_watch_history_uses_share_class_ticker_and_keeps_current_bar_provisional(self):
+        meta = {**META, 'code': 'US.BRK-B', 'symbol': 'BRK-B', 'provider_symbol': 'BRK-B'}
+        current = dt.datetime.fromisoformat('2026-11-10T17:00:00+00:00')
+        candles = [{'t': int((current - dt.timedelta(days=days)).timestamp() * 1000),
+                    'o': 10, 'h': 12, 'l': 9, 'c': 11, 'v': 100} for days in (2, 1, 0)]
+        payload = {'status': 'DELAYED', 'ticker': 'BRK.B', 'results': candles}
+        original_daily = app.massive_daily
+        with patch.object(app, 'massive_daily', side_effect=lambda ticker: original_daily(ticker, current=current)), \
+             patch.object(app, 'massive_json', return_value=payload) as massive, \
+             patch.object(app, 'read_yahoo_chart') as yahoo:
+            code, record = app.load_international_asset(meta)
+        yahoo.assert_not_called()
+        self.assertIn('/ticker/BRK.B/', massive.call_args.args[0])
+        self.assertEqual((code, record['history_provider'], record['closed_as_of']), ('US.BRK-B', 'Massive', '2026-11-09'))
+        self.assertFalse(record['bars'][-1]['completed'])
+        self.assertEqual(record['latest_quote']['timestamp'], '2026-11-10')
+        self.assertIn('延迟', record['source'])
     def test_registry_persists_revisions_duplicate_and_stale_edits_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             p=Path(folder)/'cache.json';store=self.store(p)

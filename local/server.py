@@ -23,6 +23,7 @@ import io
 import sys
 import tempfile
 import struct
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -44,6 +45,14 @@ TENCENT = 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get'
 QUOTE = 'https://qt.gtimg.cn/q='
 SINA_QUOTE = 'https://hq.sinajs.cn/list='
 IFIND_ENDPOINT = 'https://api-mcp.51ifind.com:8643/ds-mcp-servers/hexin-ifind-ds-{}-mcp'
+MASSIVE_API = 'https://api.massive.com'
+PINGAN_QUOTE = 'https://ai.stock.pingan.com/restapi/hangqing/adapter/hangQing/stockDynamic'
+MARKET_KEY_SETTINGS = {
+    'massive': ('Massive', 'MASSIVE_API_KEY'),
+    'pingan': ('平安证券', 'PINGAN_SKILL_APIKEY'),
+}
+MARKET_KEY_TEST_PATHS = {'/api/ifind/test': 'ifind', '/api/market-keys/massive/test': 'massive',
+                         '/api/market-keys/pingan/test': 'pingan'}
 TOKEN = secrets.token_urlsafe(24)
 NETWORK_LIMIT = threading.BoundedSemaphore(8)
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -60,6 +69,7 @@ IFIND_OPENER = urllib.request.build_opener(NoMarketRedirect())
 IFIND_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoMarketRedirect())
 IFIND_LOCK = threading.Lock()
 IFIND_SETTINGS_LOCK = threading.Lock()
+MARKET_KEY_LOCKS = {provider: threading.Lock() for provider in MARKET_KEY_SETTINGS}
 IFIND_NEXT_CALL = 0
 
 
@@ -214,14 +224,17 @@ def ifind_token():
 
 
 def save_ifind_settings(token):
-    path = ifind_settings_path()
+    save_private_settings(ifind_settings_path(), {'auth_token': token})
+
+
+def save_private_settings(path, settings):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
-                                         prefix='.ifind-', suffix='.tmp', delete=False) as handle:
+                                         prefix=f'.{path.stem}-', suffix='.tmp', delete=False) as handle:
             temp = Path(handle.name)
-            json.dump({'auth_token': token}, handle)
+            json.dump(settings, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
@@ -236,6 +249,105 @@ def ifind_connection_status():
         return {'configured': True}
     except ValueError as exc:
         return {'configured': False, 'message': str(exc)}
+
+
+def market_key_path(provider):
+    return Path.home() / '.risklens' / f'{provider}.json'
+
+
+def validate_market_key(provider, value):
+    label, _ = MARKET_KEY_SETTINGS[provider]
+    key = value.strip() if isinstance(value, str) else ''
+    if not re.fullmatch(r'[!-~]{1,2048}', key):
+        raise ValueError(f'{label} 密钥格式无效')
+    return key
+
+
+def market_key(provider):
+    label, env = MARKET_KEY_SETTINGS[provider]
+    try:
+        with market_key_path(provider).open(encoding='utf-8') as handle:
+            return validate_market_key(provider, json.loads(handle.read(8192))['api_key'])
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError(f'无法读取本地 {label} 密钥配置') from None
+    if os.environ.get(env):
+        return validate_market_key(provider, os.environ[env])
+    raise ValueError(f'未配置 {label} 密钥，请在「数据与方法 → 行情密钥专区」配置')
+
+
+def market_key_status(provider):
+    try:
+        market_key(provider)
+        return {'configured': True}
+    except ValueError as exc:
+        return {'configured': False, 'message': str(exc)}
+
+
+def authenticated_market_json(label, url, headers, data=None):
+    def read(opener):
+        request = urllib.request.Request(url, data=data, headers=headers)
+        with opener.open(request, timeout=10) as response:
+            body = response.read(2 * 1024 * 1024 + 1)
+        if len(body) > 2 * 1024 * 1024:
+            raise ValueError(f'{label} 响应超过大小上限')
+        return json.loads(body)
+
+    try:
+        with NETWORK_LIMIT:
+            try:
+                payload = read(IFIND_DIRECT if PROXY_MODE == 'direct' else IFIND_OPENER)
+            except OSError as exc:
+                host = urllib.parse.urlsplit(url).netloc
+                if PROXY_MODE != 'auto' or not connection_refused(exc) or not local_proxy_address(host, 'https'):
+                    raise
+                payload = read(IFIND_DIRECT)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        hints = {401: '请检查密钥是否有效', 403: '请检查密钥及该市场或接口的订阅权限',
+                 429: '已达到请求额度，请稍后重试'}
+        raise ValueError(f'{label} HTTP {exc.code}：{hints.get(exc.code, "行情接口请求失败")}') from None
+    except OSError as exc:
+        reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        hint = '连接超时' if isinstance(reason, TimeoutError) else '网络连接失败，请检查网络或代理'
+        raise ValueError(f'{label}：{hint}') from None
+    except (json.JSONDecodeError, UnicodeError):
+        raise ValueError(f'{label} 返回了无效 JSON') from None
+    if not isinstance(payload, dict):
+        raise ValueError(f'{label} 返回了无效数据结构')
+    return payload
+
+
+def massive_json(url, key=None):
+    payload = authenticated_market_json('Massive', url, {
+        'Authorization': 'Bearer ' + (key if key is not None else market_key('massive')),
+        'Accept': 'application/json',
+    })
+    status = payload.get('status')
+    if status not in ('OK', 'DELAYED'):
+        hint = '请检查密钥及该市场的订阅权限' if status in ('NOT_AUTHORIZED', 'UNAUTHORIZED') else '接口未返回成功状态'
+        raise ValueError(f'Massive：{hint}')
+    return payload
+
+
+def pingan_test_quote(key):
+    request_id = str(uuid.uuid4())
+    payload = authenticated_market_json('平安证券', PINGAN_QUOTE, {
+        'X-API-Key': key, 'X-Skill-ID': 'market-query', 'X-Request-ID': request_id,
+        'channelId': 'c_lite_adapgaty_a_skill', 'requestId': request_id,
+        'Content-Type': 'application/json', 'Accept': 'application/json',
+    }, b'{"codes":["SH600519"]}')
+    if payload.get('code') not in (0, '0'):
+        raise ValueError('平安证券行情接口拒绝请求，请检查密钥、权限及额度')
+    data = payload.get('data')
+    items = data.get('items') if isinstance(data, dict) else None
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get('code') == 'SH600519':
+            price = number(item.get('price'))
+            if price is not None and price > 0:
+                return {'price': price}
+    raise ValueError('平安证券未返回可核验的样例报价')
 
 
 def ifind_post(service, token, method, request_id=None, params=None, session=None, version=None):
@@ -318,7 +430,18 @@ def parse_ifind_quotes(result, symbols):
             except (ValueError, RecursionError):
                 pass
             return
-        for key in ('data', 'rows', 'quotes', 'tables'):
+        tables = node.get('tables')
+        if isinstance(tables, list) and tables and isinstance(tables[0], list):
+            columns = tables[0]
+            # The live iFinD quote tools return a header row followed by value rows.
+            if (all(isinstance(column, str) for column in columns)
+                    and {'证券代码', '最新价'} <= set(columns) and len(columns) == len(set(columns))):
+                for values in tables[1:]:
+                    if isinstance(values, list) and len(values) == len(columns):
+                        visit(dict(zip(columns, values)))
+        else:
+            visit(tables)
+        for key in ('data', 'rows', 'quotes'):
             if isinstance(node.get(key), (list, dict)):
                 visit(node[key])
 
@@ -438,6 +561,44 @@ def test_ifind_connection(payload):
                 **ifind_connection_status()}
     finally:
         IFIND_SETTINGS_LOCK.release()
+
+
+def test_market_key(provider, payload):
+    has_new_key = 'token' in payload
+    key = validate_market_key(provider, payload['token']) if has_new_key else market_key(provider)
+    lock = MARKET_KEY_LOCKS[provider]
+    if not lock.acquire(blocking=False):
+        raise RuntimeError(f'{MARKET_KEY_SETTINGS[provider][0]} 正在测试，请稍后重试')
+    try:
+        if provider == 'massive':
+            probes = [(label, ticker, lambda ticker=ticker: massive_test_quote(ticker, key))
+                      for label, ticker in (('美股', 'AAPL'), ('费城半导体指数', 'I:SOX'), ('比特币', 'X:BTCUSD'))]
+        else:
+            probes = [('A 股', '600519', lambda: pingan_test_quote(key))]
+        checks = []
+        for label, symbol, probe in probes:
+            check = {'market': label, 'symbol': symbol}
+            try:
+                check.update(ok=True, **probe())
+            except ValueError as exc:
+                check.update(ok=False, error=str(exc))
+            checks.append(check)
+        passed = sum(check['ok'] for check in checks)
+        saved, save_error = False, None
+        if passed and has_new_key:
+            try:
+                save_private_settings(market_key_path(provider), {'api_key': key})
+                if provider == 'massive':
+                    with SEARCH_LOCK:
+                        SEARCH_CACHE.clear()
+                saved = True
+            except OSError:
+                save_error = '报价测试通过，但本机无法写入密钥设置，请检查权限后重试'
+        return {'result': ('ok' if passed == len(checks) else 'partial') if passed else 'failed',
+                'checked_at': now(), 'checks': checks, 'saved': saved, 'save_error': save_error,
+                **market_key_status(provider)}
+    finally:
+        lock.release()
 
 
 def canonical_quote_name(quote, expected):
@@ -585,7 +746,8 @@ def load_asset(asset, quotes, previous=None):
                           'adjustment': 'none', 'completed': bars[-1]['completed'], 'bars': bars,
                           'fundamentals': None, 'fetched_at': now(), 'latest_quote': quote,
                           'volume_unit': unit, 'provider_url': url, 'skipped_rows': skipped,
-                          'history_checked_at': now(), 'fallback_errors': errors}
+                          'history_checked_at': now(), 'history_provider': provider.removesuffix('日线'),
+                          'fallback_errors': errors}
         except Exception as exc:
             errors.append(provider + ': ' + str(exc)[:160])
     raise ValueError('；'.join(errors))
@@ -938,6 +1100,92 @@ GLOBAL_ASSETS = [
 ]
 
 
+# Match the instrument itself and the market ID, including COMEX continuous contracts.
+EASTMONEY_EXTERNAL = {
+    'DXY': '100.UDI', 'CNH': '133.USDCNH', 'DJI': '100.DJIA', 'IXIC': '100.NDX',
+    'N225': '100.N225', 'KOSPI': '100.KS11', 'A50': '100.XIN9', 'GOLD': '101.GC00Y',
+    'SILVER': '101.SI00Y', 'usSOXX': '105.SOXX', 'usQQQ': '105.QQQ', 'usNVDA': '105.NVDA',
+    'usMU': '105.MU', 'usTSM': '106.TSM', 'usAVGO': '105.AVGO',
+}
+EXTERNAL_TIMEZONES = {
+    'N225': 'Asia/Tokyo', 'KOSPI': 'Asia/Seoul', 'hkHSTECH': 'Asia/Hong_Kong',
+    'A50': 'Asia/Shanghai', 'CNH': 'Asia/Shanghai', 'BTC': 'UTC',
+}
+YAHOO_CHART_HOSTS = ('query1.finance.yahoo.com', 'query2.finance.yahoo.com')
+
+
+def massive_day(instant, timezone):
+    try:
+        from zoneinfo import ZoneInfo
+        return instant.astimezone(ZoneInfo(timezone)).date()
+    except (ImportError, KeyError):
+        if timezone == 'UTC':
+            return instant.astimezone(dt.timezone.utc).date()
+        # Standalone Python on Windows may lack IANA data. The recent US window is post-2007.
+        year = instant.astimezone(dt.timezone.utc).year
+        march = dt.datetime(year, 3, 8, 7, tzinfo=dt.timezone.utc)
+        november = dt.datetime(year, 11, 1, 6, tzinfo=dt.timezone.utc)
+        start = march + dt.timedelta(days=(6 - march.weekday()) % 7)
+        end = november + dt.timedelta(days=(6 - november.weekday()) % 7)
+        return instant.astimezone(dt.timezone(dt.timedelta(hours=-4 if start <= instant < end else -5))).date()
+
+
+def massive_daily(ticker, key=None, days=720, current=None):
+    timezone = 'UTC' if ticker.startswith('X:') else 'America/New_York'
+    current = current or dt.datetime.now(dt.timezone.utc)
+    today = massive_day(current, timezone)
+    start = today - dt.timedelta(days=days)
+    url = f'{MASSIVE_API}/v2/aggs/ticker/{urllib.parse.quote(ticker, safe=":")}/range/1/day/{start}/{today}'
+    url += '?adjusted=true&sort=asc&limit=5000'
+    payload = massive_json(url, key)
+    if payload.get('ticker') != ticker:
+        raise ValueError('Massive 日线标的身份不匹配')
+    rows = {}
+    results = payload.get('results')
+    for item in results if isinstance(results, list) else []:
+        if not isinstance(item, dict) or type(item.get('t')) is not int:
+            continue
+        try:
+            day = massive_day(dt.datetime.fromtimestamp(item['t'] / 1000, dt.timezone.utc), timezone)
+        except (OverflowError, OSError, ValueError):
+            continue
+        prices = {field: number(item.get(key)) for field, key in (
+            ('open', 'o'), ('high', 'h'), ('low', 'l'), ('close', 'c'))}
+        if start <= day <= today and prices['close'] is not None and prices['close'] > 0:
+            rows[day] = {'date': day.isoformat(), **prices, 'vol': number(item.get('v')),
+                         'completed': day < today}
+    if not rows:
+        raise ValueError('Massive 未返回可核验的日线')
+    return [rows[day] for day in sorted(rows)], url, timezone, payload['status'] == 'DELAYED'
+
+
+def massive_test_quote(ticker, key):
+    rows, _, _, delayed = massive_daily(ticker, key=key, days=10)
+    return {'price': rows[-1]['close'], 'timestamp': rows[-1]['date'],
+            'detail': '延迟数据' if delayed else '日线数据'}
+
+
+def load_massive_global(ticker):
+    rows, url, timezone, delayed = massive_daily(ticker)
+    last = rows[-1]
+    return {'history': [{'date': b['date'], 'close': b['close']} for b in rows],
+            'timestamp': last['date'], 'timezone': timezone, 'provisional': not last['completed'],
+            'delayed': delayed}, url
+
+
+def read_yahoo_chart(ticker, query, parse, errors):
+    for host in YAHOO_CHART_HOSTS:
+        url = f'https://{host}/v8/finance/chart/{urllib.parse.quote(ticker, safe="")}?{query}'
+        try:
+            result = json.loads(fetch(url))['chart']['result'][0]
+            if result['meta']['symbol'].upper() != ticker.upper():
+                raise ValueError('标的身份不匹配')
+            return parse(result), url
+        except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError) as exc:
+            errors.append(f'Yahoo Finance {host.split(".")[0]}：{str(exc)[:130]}')
+    raise ValueError('；'.join(errors))
+
+
 def fetch_json_history(url):
     # One retry for transient upstream gateway failures; never retry auth or rate-limit errors.
     for attempt in range(2):
@@ -963,69 +1211,133 @@ def external_changes(history, kind):
     return out
 
 
+def global_history(points, today):
+    values = {}
+    for date, raw in points:
+        try:
+            date = dt.date.fromisoformat(date).isoformat()
+        except (TypeError, ValueError):
+            continue
+        close = number(raw)
+        if close is not None and close > 0 and date <= today:
+            values[date] = close
+    history = [{'date': d, 'close': c} for d, c in sorted(values.items())][-756:]
+    if not history:
+        raise ValueError('缺少有效日线')
+    return history
+
+
+def parse_yahoo_global(result, kind):
+    meta = result['meta']
+    offset = dt.timezone(dt.timedelta(seconds=meta.get('gmtoffset', 0)))
+    zone = market_timezone(meta) if meta.get('exchangeTimezoneName') else offset
+    current = dt.datetime.now(zone)
+    points = ((dt.datetime.fromtimestamp(stamp, zone).date().isoformat(), close)
+              for stamp, close in zip(result.get('timestamp') or [], result['indicators']['quote'][0].get('close') or []))
+    history = global_history(points, current.date().isoformat())
+    last = history[-1]['date']
+    stamp = meta.get('regularMarketTime')
+    stamp = dt.datetime.fromtimestamp(stamp, zone) if stamp else None
+    session = meta.get('currentTradingPeriod', {}).get('regular', {})
+    return {'history': history, 'timestamp': stamp.isoformat() if stamp and stamp.date().isoformat() == last else last,
+            'timezone': meta.get('exchangeTimezoneName'), 'provisional': last == current.date().isoformat()
+            and (kind == 'crypto' or session.get('start', 1e20) <= current.timestamp() < session.get('end', 0))}
+
+
+def external_backup(symbol):
+    if symbol in EASTMONEY_EXTERNAL:
+        secid = EASTMONEY_EXTERNAL[symbol]
+        query = urllib.parse.urlencode({'secid': secid, 'klt': 101, 'fqt': 0, 'lmt': 600, 'beg': 0,
+                                        'end': 20500101, 'fields1': 'f1,f2,f3,f4,f5,f6',
+                                        'fields2': 'f51,f52,f53,f54,f55,f56,f57'})
+        return '东方财富', 'https://push2his.eastmoney.com/api/qt/stock/kline/get?' + query
+    if symbol == 'SOX':
+        start = (dt.datetime.now(TZ).date() - dt.timedelta(days=760)).isoformat()
+        return 'Nasdaq', f'https://api.nasdaq.com/api/quote/SOX/historical?assetclass=index&fromdate={start}&limit=600'
+    return {
+        'hkHSTECH': ('腾讯', 'https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get?param=hkHSTECH,day,,,600,qfq'),
+        'US10Y': ('FRED', 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10'),
+        'usVIX': ('Cboe', 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'),
+        'BTC': ('Coinbase', 'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400'),
+    }[symbol]
+
+
+def read_alternate_global(symbol, provider, url):
+    closed_feed = provider in ('FRED', 'Cboe', 'Nasdaq')
+    timezone = EXTERNAL_TIMEZONES.get(symbol, 'America/New_York')
+    current = dt.datetime.now(market_timezone({'exchangeTimezoneName': timezone}))
+    today = current.date().isoformat()
+    if provider == '东方财富':
+        market, code = EASTMONEY_EXTERNAL[symbol].split('.')
+        payload = fetch_json_history(url)['data']
+        if not payload or payload['code'] != code or str(payload.get('market')) != market:
+            raise ValueError('跨市场历史标的身份不匹配')
+        points = ((cells[0], cells[2]) for cells in (row.split(',') for row in payload['klines']) if len(cells) >= 3)
+    elif provider == '腾讯':
+        payload = json.loads(fetch(url))['data']['hkHSTECH']
+        points = ((r[0], r[2]) for r in payload['day'] if len(r) >= 3)
+    elif provider == 'Nasdaq':
+        payload = json.loads(fetch(url))['data']
+        if not payload or payload['symbol'] != 'SOX':
+            raise ValueError('费城半导体指数身份不匹配')
+        points = ((dt.datetime.strptime(r['date'], '%m/%d/%Y').date().isoformat(), r['close'].replace(',', ''))
+                  for r in payload['tradesTable']['rows'])
+    elif provider == 'Coinbase':
+        rows = json.loads(fetch(url))
+        points = ((dt.datetime.fromtimestamp(r[0], dt.timezone.utc).date().isoformat(), r[4]) for r in rows if len(r) >= 5)
+    else:
+        reader = csv.DictReader(io.StringIO(fetch(url).decode('utf-8-sig')))
+        if provider == 'FRED':
+            points = ((r['observation_date'], r['DGS10']) for r in reader)
+        else:
+            points = ((dt.datetime.strptime(r['DATE'], '%m/%d/%Y').date().isoformat(), r['CLOSE']) for r in reader)
+    history = global_history(points, today)
+    last = history[-1]['date']
+    return {'history': history, 'timestamp': last, 'timezone': timezone, 'provisional': not closed_feed and last == today}
+
+
 def load_global_asset(asset):
     symbol, name, ticker, unit, kind, weight = asset
-    url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker, safe='') + '?range=2y&interval=1d'
+    yahoo_link = 'https://finance.yahoo.com/quote/' + urllib.parse.quote(ticker, safe='') + '/'
+    massive_ticker = {'SOX': 'I:SOX', 'BTC': 'X:BTCUSD'}.get(symbol)
+    if symbol.startswith('us') and kind == 'equity':
+        massive_ticker = ticker
     row = {'symbol': symbol, 'name': name, 'ticker': ticker, 'unit': unit, 'kind': kind, 'weight': RISK_WEIGHTS.get(symbol, weight),
-           'url': 'https://finance.yahoo.com/quote/' + urllib.parse.quote(ticker, safe='') + '/',
-           'source': 'Yahoo Finance 日频价格（非总回报）', 'provider_url': url, 'fetched_at': now()}
+           'url': 'https://massive.com/' if massive_ticker else yahoo_link, 'fetched_at': now()}
+    errors = []
+    record, url, provider = None, None, 'Massive' if massive_ticker else 'Yahoo Finance'
     try:
-        result = json.loads(fetch(url))['chart']['result'][0]
-        meta = result['meta']
-        if meta.get('symbol', '').upper() != ticker.upper():
-            raise ValueError('标的身份不匹配')
-        stamps = result.get('timestamp') or []
-        closes = result['indicators']['quote'][0].get('close') or []
-        offset = dt.timezone(dt.timedelta(seconds=meta.get('gmtoffset', 0)))
-        values = {}
-        for stamp, close in zip(stamps, closes):
-            if isinstance(close, (int, float)) and math.isfinite(close) and close > 0:
-                day = dt.datetime.fromtimestamp(stamp, offset).date().isoformat()
-                if day <= dt.datetime.now(TZ).date().isoformat():
-                    values[day] = float(close)
-        history = [{'date': d, 'close': c} for d, c in sorted(values.items())]
-        if symbol == 'hkHSTECH' and len(history) < 251:
-            try:
-                fallback = 'https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get?param=hkHSTECH,day,,,600,qfq'
-                payload = json.loads(fetch(fallback))['data']['hkHSTECH']
-                rows = payload.get('day') or payload.get('qfqday') or []
-                for r in rows:
-                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', str(r[0])) and float(r[2]) > 0:
-                        values[r[0]] = float(r[2])
-                history = [{'date': d, 'close': c} for d, c in sorted(values.items()) if d <= dt.datetime.now(TZ).date().isoformat() and math.isfinite(c)][-756:]
-                row.update(history_source='腾讯恒生科技日线 + Yahoo最新日线', history_url=fallback)
-            except Exception as exc:
-                row['history_error'] = str(exc)[:150]
-        if symbol in ('CNH', 'A50') and len(history) < 251:
-            try:
-                secid, expected_code = ('133.USDCNH', 'USDCNH') if symbol == 'CNH' else ('100.XIN9', 'XIN9')
-                fallback = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + secid + '&klt=101&fqt=0&lmt=600&beg=0&end=20500101&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57'
-                row.update(history_source='东方财富' + expected_code + '历史日线', history_url=fallback)
-                payload = fetch_json_history(fallback)['data']
-                if payload['code'] != expected_code:
-                    raise ValueError('跨市场历史标的身份不匹配')
-                for r in payload.get('klines') or []:
-                    cells = r.split(',')
-                    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', cells[0]) and float(cells[2]) > 0:
-                        values[cells[0]] = float(cells[2])
-                history = [{'date': d, 'close': c} for d, c in sorted(values.items()) if d <= dt.datetime.now(TZ).date().isoformat() and math.isfinite(c)][-756:]
-                row.update(history_source='东方财富' + expected_code + '日线 + Yahoo最新日线', history_url=fallback)
-            except Exception as exc:
-                row['history_error'] = str(exc)[:150]
-        if not history:
-            raise ValueError('缺少有效日线')
-        stamp = meta.get('regularMarketTime')
-        quote_time = dt.datetime.fromtimestamp(stamp, offset).isoformat() if stamp else history[-1]['date']
-        row.update(history=history, history_as_of=history[-1]['date'], price=history[-1]['close'],
-                   change=(history[-1]['close']/history[-2]['close']-1)*100 if len(history)>1 and kind != 'yield' else None,
-                   timestamp=quote_time, timezone=meta.get('exchangeTimezoneName', '供应商市场时区'),
-                   observation_basis='日频观察值；比特币含周末' if kind == 'crypto' else '供应商有效日线；不插值',
-                   returns=external_changes(history, kind),
-                   provisional=bool(history[-1]['date'] == dt.datetime.now(offset).date().isoformat() and (kind == 'crypto' or meta.get('currentTradingPeriod', {}).get('regular', {}).get('start', 1e20) <= time.time() < meta.get('currentTradingPeriod', {}).get('regular', {}).get('end', 0))),
-                   stale=(dt.datetime.now(TZ).date()-dt.date.fromisoformat(history[-1]['date'])).days > (2 if kind == 'crypto' else 7))
-    except Exception as exc:
-        row.update(error=str(exc)[:180], price=None, history=[], returns=external_changes([], kind), stale=True)
-    return row
+        if massive_ticker:
+            record, url = load_massive_global(massive_ticker)
+        else:
+            record, url = read_yahoo_chart(ticker, 'range=2y&interval=1d', lambda result: parse_yahoo_global(result, kind), errors)
+    except ValueError as exc:
+        if massive_ticker:
+            errors.append(str(exc))
+    if record is None or (symbol in ('A50', 'CNH', 'hkHSTECH') and len(record['history']) < 251):
+        backup_provider, backup_url = external_backup(symbol)
+        try:
+            backup = read_alternate_global(symbol, backup_provider, backup_url)
+            # Keep each return window on one provider's price series.
+            if record is None or (backup['history'][-1]['date'] >= record['history'][-1]['date']
+                                  and len(backup['history']) > len(record['history'])):
+                record, url, provider = backup, backup_url, backup_provider
+        except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError) as exc:
+            errors.append(f'{backup_provider}：{str(exc)[:150]}')
+    if record is None:
+        return {**row, 'error': '；'.join(errors), 'price': None, 'history': [], 'returns': external_changes([], kind), 'stale': True}
+    history = record['history']
+    last = history[-1]['date']
+    basis = ' 日频收益率' if kind == 'yield' else ' 日频价格（非总回报）'
+    if record.get('delayed'):
+        basis += ' · 延迟'
+    return {**row, **record, 'provider': provider, 'source': provider + basis,
+            'url': yahoo_link if provider == 'Yahoo Finance' else url, 'provider_url': url, 'history_url': url,
+            'history_source': provider + '日线', 'history_as_of': last, 'price': history[-1]['close'],
+            'change': (history[-1]['close'] / history[-2]['close'] - 1) * 100 if len(history) > 1 and kind != 'yield' else None,
+            'observation_basis': '日频观察值；比特币含周末' if kind == 'crypto' else '供应商有效日线；不插值',
+            'returns': external_changes(history, kind), 'fallback_errors': errors,
+            'stale': (dt.datetime.now(TZ).date() - dt.date.fromisoformat(last)).days > (2 if kind == 'crypto' else 7)}
 
 
 def merge_external(previous, current):
@@ -1033,10 +1345,17 @@ def merge_external(previous, current):
     output = []
     for row in current:
         old = prior.get(row['symbol'], {})
-        if row.get('error') and old:
-            output.append({**old, 'error': row['error'], 'retained': True})
+        older = bool(old.get('history_as_of') and row.get('history_as_of')
+                     and row['history_as_of'] < old['history_as_of'])
+        if old and (row.get('error') or older):
+            error = row.get('error') or '新取得的日线早于缓存日期'
+            output.append({**old, 'error': error, 'retained': True})
             continue
-        if (old.get('ticker') == row.get('ticker') and len(old.get('history', [])) > len(row.get('history', []))
+        old_provider = old.get('provider')
+        if not old_provider and not old.get('history_source') and str(old.get('source', '')).startswith('Yahoo Finance'):
+            old_provider = 'Yahoo Finance'
+        if (old_provider == row.get('provider') and old.get('ticker') == row.get('ticker')
+                and len(old.get('history', [])) > len(row.get('history', []))
                 and row.get('history') and old['history'][-1]['date'] <= row['history'][-1]['date']):
             values = {r['date']: r['close'] for r in old['history']}
             values.update({r['date']: r['close'] for r in row['history']})
@@ -1051,6 +1370,9 @@ def merge_external(previous, current):
 def load_external():
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         return list(pool.map(load_global_asset, GLOBAL_ASSETS))
+
+
+QUOTE_PROVIDER_NAMES = {'腾讯公开行情': '腾讯', '新浪公开行情': '新浪', '同花顺 iFinD Level 1': '同花顺 iFinD'}
 
 
 GPR_URL = 'https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.dta'
@@ -1202,8 +1524,29 @@ def search_securities(query, market='ALL'):
         cached = SEARCH_CACHE.get(key)
         if cached and time.monotonic() - cached[0] < 180:
             return [dict(x) for x in cached[1]]
-    url = 'https://smartbox.gtimg.cn/s3/?' + urllib.parse.urlencode({'q': query, 't': 'all'})
-    rows = parse_security_search(fetch(url), market)
+    rows, errors, aliases = [], [], []
+    localized = bool(re.search(r'[\u3400-\u9fff]', query))
+    if market in ('ALL', 'CN', 'HK') or localized:
+        url = 'https://smartbox.gtimg.cn/s3/?' + urllib.parse.urlencode({'q': query, 't': 'all'})
+        try:
+            for row in parse_security_search(fetch(url), market):
+                (aliases if row['market'] == 'US' else rows).append(row)
+        except (OSError, ValueError) as exc:
+            if market != 'US':
+                errors.append(f'腾讯证券搜索：{exc}')
+    if market == 'US' or market == 'ALL' and not re.fullmatch(r'\d{1,6}(?:\.HK)?', query, re.I):
+        try:
+            if localized and aliases:
+                alias = next((row for row in aliases if row['name'] == query), aliases[0])
+                rows.extend(row for row in search_massive_securities(alias['symbol']) if row['code'] == alias['code'])
+            else:
+                rows.extend(search_massive_securities(query))
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        if rows:
+            return rows
+        raise ValueError('；'.join(errors))
     with SEARCH_LOCK:
         if len(SEARCH_CACHE) > 200:
             SEARCH_CACHE.clear()
@@ -1211,14 +1554,52 @@ def search_securities(query, market='ALL'):
     return rows
 
 
+def massive_security(row):
+    if not isinstance(row, dict):
+        return None
+    ticker, name = row.get('ticker'), row.get('name')
+    if (row.get('market') != 'stocks' or row.get('locale') != 'us' or row.get('active') is not True
+            or str(row.get('currency_name', '')).lower() != 'usd'
+            or row.get('type') not in ('CS', 'ETF', 'ADRC', 'ADRP', 'ADRR', 'REIT')
+            or not isinstance(ticker, str) or not re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', ticker)
+            or not isinstance(name, str) or not name.strip() or re.search(r'[<>\x00-\x1f]', name)):
+        return None
+    # Preserve the watchlist ID previously used for share classes, e.g. US.BRK-B.
+    symbol = ticker.replace('.', '-')
+    return {'code': asset_id('US', symbol), 'symbol': symbol, 'name': name.strip()[:100],
+            'market': 'US', 'type': 'etf' if row['type'] == 'ETF' else 'stock', 'currency': 'USD',
+            'provider_symbol': ticker, 'timezone': 'America/New_York', 'search_source': 'Massive',
+            'watch': False, 'benchmark': False}
+
+
+def search_massive_securities(query):
+    if re.fullmatch(r'[A-Za-z][A-Za-z0-9.-]{0,14}', query):
+        query = query.replace('-', '.')
+    params = {'market': 'stocks', 'locale': 'us', 'active': 'true', 'search': query, 'limit': 30}
+    payload = massive_json(f'{MASSIVE_API}/v3/reference/tickers?' + urllib.parse.urlencode(params))
+    results = payload.get('results', [])
+    if not isinstance(results, list):
+        raise ValueError('Massive 未返回有效的证券列表')
+    rows = {meta['code']: meta for row in results if (meta := massive_security(row))}
+    return sorted(rows.values(), key=lambda meta: meta['provider_symbol'] != query.upper())
+
+
 def resolve_security(market, symbol):
     market = str(market).upper()
     code = asset_id(market, symbol)
     search_symbol = code.split('.', 1)[1] if market != 'CN' else code
+    if market == 'US':
+        ticker = search_symbol.replace('-', '.')
+        candidates = search_securities(ticker, 'US')
+        meta = next((r for r in candidates if r['provider_symbol'] == ticker), None)
+        if not meta:
+            url = f'{MASSIVE_API}/v3/reference/tickers/{urllib.parse.quote(ticker, safe="")}'
+            meta = massive_security(massive_json(url).get('results'))
+        if not meta or meta['provider_symbol'] != ticker:
+            raise ValueError('Massive 未确认该美元股票或 ETF，请从美股搜索结果添加')
+        return {**meta, 'watch': True, 'verified_at': now(), 'verified_name': meta['name']}
     candidates = search_securities(search_symbol, market)
     meta = next((r for r in candidates if r['code'] == code), None)
-    if not meta and market == 'US' and '-' in search_symbol:
-        meta = next((r for r in search_securities(search_symbol.replace('-', '.'), market) if r['code'] == code), None)
     if not meta:
         raise ValueError('证券搜索源未确认该标的；请从搜索结果添加')
     meta = dict(meta)
@@ -1228,14 +1609,11 @@ def resolve_security(market, symbol):
             raise ValueError('证券名称与报价源核验不一致')
     else:
         symbol = yahoo_symbol(meta)
-        url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(symbol, safe='') + '?range=5d&interval=1d'
-        result = json_get(url)['chart']['result'][0]['meta']
+        result, _ = read_yahoo_chart(symbol, 'range=5d&interval=1d', lambda row: row['meta'], [])
         if result.get('symbol', '').upper() != symbol.upper() or result.get('instrumentType') not in ('EQUITY', 'ETF'):
             raise ValueError('海外行情源未确认股票/ETF身份')
         if market == 'HK' and result.get('exchangeName') != 'HKG':
             raise ValueError('港股交易所核验失败')
-        if market == 'US' and result.get('currency') != 'USD':
-            raise ValueError('当前美股模块仅接受美元交易的股票/ETF')
         meta.update(currency=result.get('currency') or meta['currency'], provider_symbol=symbol,
                     type='etf' if result['instrumentType'] == 'ETF' else 'stock',
                     timezone=result.get('exchangeTimezoneName'), verified_name=result.get('longName') or result.get('shortName'))
@@ -1299,14 +1677,13 @@ def parse_international_chart(result, identity, current=None):
 
 
 def load_international_asset(meta, previous=None):
-    ticker = yahoo_symbol(meta)
-    url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + urllib.parse.quote(ticker, safe='') + '?range=5y&interval=1d&includePrePost=false'
-    try:
-        result = json_get(url)['chart']['result'][0]
-        record = parse_international_chart(result, meta)
-    except (OSError, ValueError, TypeError, KeyError, IndexError) as exc:
-        raise ValueError(f'Yahoo Finance 港美股日线：{str(exc)[:160]}') from exc
-    record['provider_url'] = url
+    if meta['market'] == 'US':
+        record = load_massive_stock(meta)
+    else:
+        errors = []
+        record, url = read_yahoo_chart(yahoo_symbol(meta), 'range=5y&interval=1d&includePrePost=false',
+                                       lambda result: parse_international_chart(result, meta), errors)
+        record.update(provider_url=url, history_provider='Yahoo Finance', fallback_errors=errors)
     prior_dates = [b['date'] for b in record['bars'] if b['completed']]
     # Re-fetching all daily bars repairs the last previously-provisional trading session.
     target = max((b['date'] for b in (previous or {}).get('bars', []) if b.get('completed') is False and any(x['date'] == b['date'] and x['completed'] for x in record['bars'])), default=None)
@@ -1321,6 +1698,31 @@ def load_international_asset(meta, previous=None):
             record[key] = previous[key]
     record['research_fetched_at'] = now()
     return meta['code'], record
+
+
+def load_massive_stock(meta):
+    # Existing catalog entries used Yahoo's dash for share classes, while Massive uses a dot.
+    ticker = (meta.get('provider_symbol') or meta['symbol']).replace('-', '.')
+    daily, url, timezone, delayed = massive_daily(ticker)
+    checked_at = now()
+    source = 'Massive 日线（拆股调整）' + (' · 延迟' if delayed else '')
+    bars = []
+    for row in daily:
+        o, h, l, c, v = (row[key] for key in ('open', 'high', 'low', 'close', 'vol'))
+        if None in (o, h, l, v) or min(o, c) <= 0 or not 0 < l <= min(o, c) or h < max(o, c) or v < 0:
+            continue
+        bars.append({**row, 'observed_at': checked_at, 'bar_source': source, 'netFlow': None})
+    if not bars:
+        raise ValueError('Massive 未返回可核验的美股 OHLCV 日线')
+    last = bars[-1]
+    return {'source': source, 'provider_url': url, 'history_provider': 'Massive', 'as_of': last['date'],
+            'closed_as_of': max((b['date'] for b in bars if b['completed']), default=None),
+            'adjustment': 'provider', 'completed': last['completed'], 'bars': bars, 'volume_unit': '股/份',
+            'market': 'US', 'currency': 'USD', 'timezone': timezone, 'fetched_at': checked_at,
+            'history_checked_at': checked_at, 'fundamentals': None,
+            'latest_quote': {'price': last['close'], 'code': meta['code'], 'name': meta['name'],
+                             'timestamp': last['date'], 'date': last['date'], 'source': source},
+            'international_method': 'Massive 美元日线按拆股调整，非总回报。纽约当地当日的日线暂不进入确认回测。'}
 
 
 def load_watch_record(meta, previous=None, quotes=None):
@@ -1476,7 +1878,7 @@ class DataStore:
         self.registry_activated = False
         self.data_revision = 0
         self.state = {'busy': False, 'done': 0, 'total': len(ASSETS), 'stage': 'idle', 'errors': {}, 'last_refresh': None,
-                      'price_result': None, 'quote_sources': {},
+                      'price_result': None, 'quote_sources': {}, 'successful_quote_sources': [],
                       'cache_path': str(self.cache), 'cache_warning': None, 'cache_persisted': False}
         self.snapshot = {'data_kind': 'local', 'instruments': {}, 'as_of': None}
         # A previous run may have switched directories. Resume its newest valid cache.
@@ -1542,6 +1944,9 @@ class DataStore:
         self.commit_snapshot(snapshot)
 
     def add_watch(self, market, symbol, expected_revision):
+        market = str(market).upper()
+        if market == 'US':
+            symbol = str(symbol).replace('.', '-')
         code = asset_id(market, symbol)
         with self.watch_operation_lock:
             with self.lock:
@@ -1736,7 +2141,8 @@ class DataStore:
             if self.state['busy']:
                 return False
             self.state.update(busy=True, done=0, total=sum(bool(m.get('watch') or m.get('benchmark')) for m in self.catalog.values()),
-                              errors={}, quote_sources={}, price_result=None, stage='准备刷新', started_at=now())
+                              errors={}, quote_sources={}, successful_quote_sources=[], price_result=None,
+                              stage='准备刷新', started_at=now())
         try:
             threading.Thread(target=self.refresh, daemon=True).start()
         except RuntimeError:
@@ -1748,6 +2154,7 @@ class DataStore:
 
     def refresh(self):
         instruments, errors, quote_only, quote_sources = {}, {}, {}, {}
+        successful_sources = set()
         prices_published = False
         try:
             with self.lock:
@@ -1836,9 +2243,13 @@ class DataStore:
                            'external': previous.get('external', []), 'geopolitics': previous.get('geopolitics', {}), 'sectors': previous.get('sectors', []), 'errors': errors}
                 self.commit_snapshot(json.loads(json.dumps(interim)))
                 prices_published = True
+                successful_sources.update(QUOTE_PROVIDER_NAMES.get(quote.get('source'))
+                                          for quote in (*quotes.values(), *fresh_quotes.values()))
+                successful_sources.update(record.get('history_provider') for record in instruments.values())
+                successful_sources.discard(None)
             with self.lock:
                 self.state.update(stage='可用行情已更新，正在补充研究数据' if prices_published else '补充财务、公告与产业证据',
-                                  errors=dict(errors))
+                                  errors=dict(errors), successful_quote_sources=sorted(successful_sources))
 
             def research(asset):
                 code, expected, _ = asset
@@ -1922,15 +2333,16 @@ class DataStore:
                         instruments[meta['code']].setdefault('research_errors', {})['financials'] = str(exc)[:180]
             has_external_update = False
             try:
-                external = load_external()
-                has_external_update = any(r.get('price') is not None and not r.get('error') for r in external)
+                external = merge_external(previous.get('external', []), load_external())
+                fresh_external = [r for r in external if r.get('price') is not None and not r.get('error') and not r.get('retained')]
+                has_external_update = bool(fresh_external)
+                successful_sources.update(r['provider'] for r in fresh_external if r.get('provider'))
                 for row in external:
                     if row.get('error'):
-                        errors['外围:' + row['symbol']] = (row.get('source') or 'Yahoo Finance') + '：' + row['error']
+                        errors['外围:' + row['symbol']] = row['error']
             except Exception as exc:
                 external = previous.get('external', [])
-                errors['外围行情'] = 'Yahoo Finance 等外围行情源：' + str(exc)[:180]
-            external = merge_external(previous.get('external', []), external)
+                errors['外围行情'] = str(exc)[:180]
             try:
                 geopolitics = load_geopolitics()
             except Exception as exc:
@@ -1943,6 +2355,8 @@ class DataStore:
                     patch_quote(sector, fresh_quotes[SYMBOLS[a[0]]])
                     if sector['as_of'] >= sectors.get(a[0], {}).get('as_of', ''):
                         sectors[a[0]] = {'code': a[0], 'name': a[1], **sector}
+                        if sector.get('history_provider'):
+                            successful_sources.add(sector['history_provider'])
                 except Exception as exc:
                     errors['sector:' + a[0]] = str(exc)[:180]
             snapshot = {'schema_version': 4, 'data_kind': 'local',
@@ -1963,6 +2377,7 @@ class DataStore:
                 price_errors = any(key != 'geopolitics' for key in errors)
                 result = ('partial' if price_errors else 'ok') if prices_published else 'failed'
                 self.state.update(busy=False, stage='完成', errors=errors, quote_sources=quote_sources,
+                                  successful_quote_sources=sorted(successful_sources) if prices_published else [],
                                   price_result=result, last_refresh=now())
 
     def commit_snapshot(self, snapshot):
@@ -2095,7 +2510,8 @@ class Handler(BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             try:
                 rows = search_securities(params.get('q', [''])[0], params.get('market', ['ALL'])[0])
-                return self.send({'results': rows, 'source': '腾讯证券搜索', 'fetched_at': now()})
+                return self.send({'results': rows, 'source': ' / '.join(sorted({r['search_source'] for r in rows})),
+                                  'fetched_at': now()})
             except ValueError as exc:
                 return self.send({'error': str(exc)}, status=400)
             except Exception as exc:
@@ -2106,7 +2522,11 @@ class Handler(BaseHTTPRequestHandler):
                           'as_of': self.server.store.snapshot.get('as_of'),
                           'closed_as_of': self.server.store.snapshot.get('closed_as_of'),
                           'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server', 'data_revision': self.server.store.data_revision, 'watchlist_revision': self.server.store.watchlist_revision, 'asset_jobs': dict(self.server.store.asset_jobs)}
-            result['ifind'] = {'available': True, **ifind_connection_status()} if self.is_private_settings_page() else {'available': False}
+            available = self.is_private_settings_page()
+            result['market_keys'] = {'ifind': {'available': available, **(ifind_connection_status() if available else {})}}
+            for provider in MARKET_KEY_SETTINGS:
+                result['market_keys'][provider] = {'available': available, **(market_key_status(provider) if available else {})}
+            result['ifind'] = result['market_keys']['ifind']
             return self.send(result)
         if path == '/api/snapshot':
             with self.server.store.lock:
@@ -2131,12 +2551,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send(text.encode(), kind + '; charset=utf-8')
 
     def do_POST(self):
-        if self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start', '/api/ifind/test'):
+        key_provider = MARKET_KEY_TEST_PATHS.get(self.path)
+        if not key_provider and self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start'):
             return self.send({'error': 'Not found'}, status=404)
         if not self.is_page_request():
             return self.send({'error': '仅允许当前页面发起操作'}, status=403)
-        if self.path == '/api/ifind/test' and not self.is_private_settings_page():
-            return self.send({'error': '请在运行服务的电脑上通过本地地址打开工作台，再配置 iFinD 密钥'}, status=403)
+        if key_provider and not self.is_private_settings_page():
+            return self.send({'error': '请在运行服务的电脑上通过本地地址打开工作台，再配置行情密钥'}, status=403)
         if not secrets.compare_digest(self.headers.get('X-RiskLens-Token', '').encode('utf-8'), TOKEN.encode('ascii')):
             return self.send({'error': '页面会话已失效，请刷新页面后重试', 'code': 'stale_session'}, status=403)
         if self.path == '/api/refresh':
@@ -2152,8 +2573,8 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError('需要JSON对象')
-            if self.path == '/api/ifind/test':
-                return self.send(test_ifind_connection(payload))
+            if key_provider:
+                return self.send(test_ifind_connection(payload) if key_provider == 'ifind' else test_market_key(key_provider, payload))
             store = self.server.store
             if self.path == '/api/screening/start':
                 return self.send({'id': store.start_screening(payload)}, status=202)
@@ -2170,8 +2591,9 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, KeyError) as exc:
             return self.send({'error': str(exc)}, status=400)
         except Exception as exc:
-            if self.path == '/api/ifind/test':
-                return self.send({'error': 'iFinD 测试未完成，请检查本机连接后重试'}, status=502)
+            if key_provider:
+                label = 'iFinD' if key_provider == 'ifind' else MARKET_KEY_SETTINGS[key_provider][0]
+                return self.send({'error': f'{label} 测试未完成，请检查本机连接后重试'}, status=502)
             return self.send({'error': str(exc)[:300]}, status=502)
 
 

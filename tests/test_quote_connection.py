@@ -16,6 +16,27 @@ SPEC.loader.exec_module(app)
 
 
 class QuoteConnection(unittest.TestCase):
+    def test_massive_authorization_uses_only_header_and_403_does_not_echo_secret(self):
+        secret = 'test-secret-massive'
+        endpoint = app.MASSIVE_API + '/v3/reference/tickers'
+        denied = app.urllib.error.HTTPError(endpoint, 403, 'Forbidden', Message(), io.BytesIO(secret.encode()))
+        with patch.object(app, 'PROXY_MODE', 'system'), patch.object(app.IFIND_OPENER, 'open', side_effect=denied) as send:
+            with self.assertRaisesRegex(ValueError, 'Massive HTTP 403') as result:
+                app.massive_json(endpoint, key=secret)
+        request = send.call_args.args[0]
+        self.assertEqual(request.get_header('Authorization'), 'Bearer ' + secret)
+        self.assertEqual(request.full_url, endpoint)
+        self.assertNotIn(secret, str(result.exception))
+
+    def test_pingan_uses_its_own_key_and_checks_the_quoted_symbol(self):
+        fixture = {'code': 0, 'data': {'items': [{'code': 'SZ600519', 'price': 2}, {'code': 'SH600519', 'price': 10}]}}
+        with patch.object(app, 'authenticated_market_json', return_value=fixture) as send:
+            self.assertEqual(app.pingan_test_quote('test-secret-pingan'), {'price': 10})
+        label, url, headers, body = send.call_args.args
+        self.assertEqual((label, url, headers['X-API-Key']), ('平安证券', app.PINGAN_QUOTE, 'test-secret-pingan'))
+        self.assertEqual(headers['requestId'], headers['X-Request-ID'])
+        self.assertEqual(app.json.loads(body), {'codes': ['SH600519']})
+
     def test_real_refused_loopback_proxy_recovers_with_a_clean_direct_request(self):
         class Feed(app.BaseHTTPRequestHandler):
             def do_GET(self):
@@ -103,6 +124,23 @@ class QuoteConnection(unittest.TestCase):
         self.assertEqual(quotes['sh588080']['volume'], 123)
         self.assertIsNone(app.quote_bar_error(quotes['sh588080']))
 
+    def test_ifind_parses_live_tabular_quote_payload_without_guessing_volume_units(self):
+        payload = {'code': 1, 'msg': 'success', 'data': {'tables': [
+            ['证券代码', '证券简称', 'time', '最新价', '开盘价', '最高价', '最低价', '成交量'],
+            ['600519.SZ', '错误市场', '2026-10-30 16:00:00', '100', '100', '101', '98', '1000'],
+            ['600519.SH', '贵州茅台', '2026-10-30 16:00:00', '101', '100', '102', '99', '1000'],
+            ['510300.SH', '沪深300ETF华泰柏瑞', '2026-10-30 16:00:00', '4.135', '4.159', '4.168', '4.128', '12031066'],
+            ['510300.SH', '不完整记录', '2026-10-30 16:30:00', '999'],
+        ]}}
+        result = {'content': [{'type': 'text', 'text': app.json.dumps(payload, ensure_ascii=False)}]}
+        quotes = app.parse_ifind_quotes(result, ['sh600519', 'sh510300'])
+        self.assertEqual(set(quotes), {'sh600519', 'sh510300'})
+        self.assertEqual(quotes['sh600519']['price'], 101)
+        self.assertEqual(quotes['sh600519']['timestamp'], '2026-10-30T16:00:00+08:00')
+        self.assertEqual(quotes['sh510300']['price'], 4.135)
+        self.assertIsNone(quotes['sh510300']['volume'])
+        self.assertIn('缺少完整', app.quote_bar_error(quotes['sh510300']))
+
     def test_ifind_mcp_accepts_the_matching_event_stream_response(self):
         stream = io.BytesIO(b'data: {"jsonrpc":"2.0","method":"notifications/message"}\n\n'
                             b'data: {"jsonrpc":"2.0","id":2,"result":{"content":[]}}\n\n')
@@ -138,12 +176,13 @@ class QuoteConnection(unittest.TestCase):
                 store = app.DataStore(path)
                 store.commit_snapshot({'data_kind': 'local', 'fetched_at': '2026-11-06T13:29:51+08:00',
                                        'catalog': store.catalog_view(), 'instruments': {'002281': old}})
-                external = {'symbol': 'usQQQ', 'price': 99}
+                external = {'symbol': 'usQQQ', 'price': 99, 'provider': '东方财富'}
                 with patch.object(app, 'load_cn_quotes', side_effect=ConnectionError('报价连接被拒绝')), \
                      patch.object(app, 'load_external', return_value=[external]), patch.object(app, 'load_geopolitics', return_value={}):
                     store.refresh()
             self.assertEqual(store.snapshot['instruments']['002281'], old)
             self.assertEqual(store.snapshot['external'][0], external)
+            self.assertEqual(store.state['successful_quote_sources'], ['东方财富'])
             self.assertIn('报价连接被拒绝', store.state['errors']['A股初始报价'])
 
 
