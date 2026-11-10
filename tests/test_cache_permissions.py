@@ -115,9 +115,12 @@ class CachePermissions(unittest.TestCase):
         record = {'as_of': '2026-10-30', 'closed_as_of': '2026-10-29',
                   'latest_quote': {'price': 10, 'timestamp': '2026-10-30T14:00:00+08:00'},
                   'bars': [{'date': '2026-10-29', 'close': 9, 'vol': 100, 'completed': True}]}
+        quotes = {app.SYMBOLS[code]: {**record['latest_quote'], 'code': code, 'name': name,
+                                   'date': '2026-10-30', 'open': 10, 'high': 11, 'low': 9, 'volume': 100}
+                  for code, name, _ in assets}
         with patch.object(app, 'ASSETS', assets), patch.object(app, 'SECTOR_ASSETS', []), \
              patch.object(app, 'fetch', return_value=b''), \
-             patch.object(app, 'parse_quotes', return_value={'sz002281': {'date': '2026-10-30'}, 'sh588080': {'date': '2026-10-30'}}), \
+             patch.object(app, 'parse_quotes', return_value=quotes), \
              patch.object(app, 'load_asset', side_effect=lambda a, q: (a[0], copy.deepcopy(record))), \
              patch.object(app, 'verify_previous'), patch.object(app, 'patch_quote'), \
              patch.object(app, 'load_financials', return_value=({'shares': 100, 'profitTTM': 10, 'revenueTTM': 20, 'bps': 1}, [])) as financials, \
