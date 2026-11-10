@@ -11,6 +11,10 @@ button[hidden]{display:none}.live-data{background:#edf8f3;border-color:#d3eade;c
 .bt-orders tfoot td{background:#edf6f4;border-top:2px solid #bfd8d2;padding-top:16px;padding-bottom:16px}.bt-orders .return-explain{white-space:normal;min-width:230px;max-width:360px}.bt-orders .table-sub{font-size:11px;line-height:1.65;margin-top:4px}
 
 .market-key-panel,.market-key-form{display:grid;gap:12px}
+.market-key-panel>h3,.market-key-panel p{margin:0}
+.market-key-section{display:grid;gap:10px;padding-top:12px;border-top:1px solid var(--line)}
 .market-key-panel .actions,.market-key-form .actions{align-items:center;flex-wrap:wrap}
 .market-key-panel ul{margin:6px 0 0;padding-inline-start:20px}
 .market-key-form input{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text)}
+
+.market-source-success{display:block;margin-top:3px;color:inherit;font-size:inherit}

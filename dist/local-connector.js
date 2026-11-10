@@ -1,5 +1,13 @@
 let localSnapshot=null,localStatus=null,localPolling=null,localRefreshError='',localRefreshPending=false;
-let ifindTesting=false,ifindResult=null,ifindError='';
+const MARKET_KEYS={
+ ifind:{name:'同花顺 iFinD',path:'/api/ifind/test',url:'https://mcp.51ifind.com/',
+  help:'A 股与场内 ETF 的备用报价。分别测试两个市场的样例报价。'},
+ massive:{name:'Massive',path:'/api/market-keys/massive/test',url:'https://massive.com/dashboard',
+  help:'用于美股和 ETF 的搜索与日线，以及 SOX 指数和 BTC/USD 日线。分别测试三类数据的访问权限。'},
+ pingan:{name:'平安证券',path:'/api/market-keys/pingan/test',url:'https://stock.pingan.com/huodong/aiskill/skillPage/index.html#/',
+  help:'管理平安证券行情查询的 API Key。测试会请求 A 股样例报价。'}
+};
+const marketKeyState=Object.fromEntries(Object.keys(MARKET_KEYS).map(id=>[id,{testing:false,result:null,error:''}]));
 const hasLocalServer=window.RISKLENS_LOCAL===true;
 async function requestLocalPost(path,payload){
  const send=()=>fetch(path,{method:'POST',mode:'same-origin',
@@ -21,57 +29,68 @@ async function refreshRequest(){
  if(typeof body.started!=='boolean')throw Error('本地服务未返回刷新状态');
  return body.started;
 }
-function marketKeyPanel(){
- const status=localStatus?.ifind;
- const available=status?.available===true;
- const configured=ifindResult?.configured??status?.configured;
- const label=ifindTesting?'正在测试…':!available?(hasLocalServer&&!localStatus?'正在检查本地连接':'请通过本机地址打开'):configured?'已配置':'未配置';
- const summary={ok:'A 股与场内 ETF 报价测试通过',partial:'部分报价测试通过',failed:'报价测试未通过'}[ifindResult?.result];
- const result=ifindResult?`<div class="notice" role="status"><strong>${esc(summary)}${ifindResult.saved?' · 密钥已保存':''}</strong>
-  ${ifindResult.save_error?`<p>${esc(ifindResult.save_error)}</p>`:''}
-  <ul>${ifindResult.checks.map(check=>`<li>${esc(check.market)} ${esc(check.symbol)} · ${check.ok?num(check.price,3)+' · '+esc(check.timestamp):esc(check.error)}</li>`).join('')}</ul></div>`:'';
- return panel('行情密钥专区',`<div class="panel-body market-key-panel">
-  <div class="definition-row"><span>同花顺 iFinD Level 1</span><strong>${label}</strong></div>
-  <p class="small muted">用作 A 股和场内 ETF 的备用报价源。确认后会分别测试两个市场的样例报价，至少一项通过时才保存新密钥。</p>
+function marketKeyStatus(id){return localStatus?.market_keys?.[id]||(id==='ifind'?localStatus?.ifind:null)}
+function marketKeySection(id,provider){
+ const status=marketKeyStatus(id),{testing,result,error}=marketKeyState[id];
+ const available=status?.available===true,configured=result?.configured??status?.configured;
+ const label=testing?'正在测试…':!available?(hasLocalServer&&!localStatus?'正在检查本地连接':'请通过本机地址打开'):configured?'已配置':'未配置';
+ const summary={ok:'行情测试通过',partial:'部分行情测试通过',failed:'行情测试未通过'}[result?.result];
+ const report=result?`<div class="notice" role="status"><strong>${esc(summary)}${result.saved?' · 密钥已保存':''}</strong>
+  ${result.save_error?`<p>${esc(result.save_error)}</p>`:''}
+  <ul>${result.checks.map(check=>`<li>${esc(check.market)} ${esc(check.symbol)} · ${check.ok?
+   [num(check.price,3),check.timestamp,check.detail].filter(Boolean).map(esc).join(' · '):esc(check.error)}</li>`).join('')}</ul></div>`:'';
+ return `<section class="market-key-section" aria-label="${esc(provider.name)}">
+  <div class="definition-row"><span>${esc(provider.name)}</span><strong>${label}</strong></div>
+  <p class="small muted">${esc(provider.help)}</p>
   <div class="actions">
-   <button type="button" class="btn primary" onclick="openIfindKey()" ${available&&!ifindTesting?'':'disabled'}>${configured?'更换密钥':'输入密钥'}</button>
-   <button type="button" class="btn" onclick="runIfindTest()" ${available&&configured&&!ifindTesting?'':'disabled'}>测试已配置密钥</button>
-   <a href="https://mcp.51ifind.com/" target="_blank" rel="noopener noreferrer">申请 / 管理 iFinD 密钥 ↗</a>
+   <button type="button" class="btn primary" onclick="openMarketKey('${id}')" ${available&&!testing?'':'disabled'}>${configured?'更换密钥':'输入密钥'}</button>
+   <button type="button" class="btn" onclick="runMarketKeyTest('${id}')" ${available&&configured&&!testing?'':'disabled'}>测试已配置密钥</button>
+   <a href="${esc(provider.url)}" target="_blank" rel="noopener noreferrer">申请 / 管理密钥 ↗</a>
   </div>
-  ${ifindTesting?'<p class="small muted" role="status">正在请求 iFinD 样例报价，请稍候。</p>':''}
-  ${ifindError?`<div class="notice" role="alert">${esc(ifindError)}</div>`:result}
-  ${available&&!configured&&status.message&&!ifindResult&&!ifindError?`<p class="small muted">${esc(status.message)}</p>`:''}
+  ${testing?`<p class="small muted" role="status">正在请求 ${esc(provider.name)} 样例行情，请稍候。</p>`:''}
+  ${error?`<div class="notice" role="alert">${esc(error)}</div>`:report}
+  ${available&&!configured&&status.message&&!result&&!error?`<p class="small muted">${esc(status.message)}</p>`:''}
+ </section>`;
+}
+function marketKeyPanel(){
+ return panel('行情密钥专区',`<div class="panel-body market-key-panel">
+  <h3>密钥管理</h3>
+  <p class="small muted">各行情源独立配置，至少一项样例通过时保存新密钥。密钥保存在运行服务的电脑上。</p>
+  ${Object.entries(MARKET_KEYS).map(([id,provider])=>marketKeySection(id,provider)).join('')}
  </div>`,'','panel-space');
 }
-function openIfindKey(){
- if(localStatus?.ifind?.available!==true||ifindTesting)return;
- modal('输入 iFinD 行情密钥',`<form class="market-key-form" method="post" onsubmit="confirmIfindKey(event)" autocomplete="off">
-  <label for="ifind-market-key">iFinD MCP 密钥</label>
-  <input id="ifind-market-key" type="password" required maxlength="2048" autocomplete="off" spellcheck="false" autofocus>
-  <p class="small muted">密钥保存在运行服务的电脑上。更换失败时继续使用之前的设置。</p>
+function openMarketKey(id){
+ const provider=MARKET_KEYS[id];
+ if(marketKeyStatus(id)?.available!==true||marketKeyState[id].testing)return;
+ modal('输入 '+provider.name+' 行情密钥',`<form class="market-key-form" method="post" onsubmit="confirmMarketKey(event,'${id}')" autocomplete="off">
+  <label for="market-key-input">${esc(provider.name)} API Key</label>
+  <input id="market-key-input" type="password" required maxlength="2048" autocomplete="off" spellcheck="false" autofocus>
+  <p class="small muted">更换失败时继续使用之前的设置。</p>
   <div class="actions"><button type="submit" class="btn primary">确认并测试</button></div>
  </form>`);
 }
-function confirmIfindKey(event){
+function confirmMarketKey(event,id){
  event.preventDefault();
  const input=event.currentTarget.querySelector('input');
  const token=input.value.trim();
  if(!token){input.focus();return;}
  input.value='';
  document.getElementById('dialog').close();
- runIfindTest({token});
+ runMarketKeyTest(id,{token});
 }
-async function runIfindTest(payload={}){
- if(localStatus?.ifind?.available!==true||ifindTesting)return;
- ifindTesting=true;ifindError='';ifindResult=null;
+async function runMarketKeyTest(id,payload={}){
+ const current=marketKeyState[id];
+ if(marketKeyStatus(id)?.available!==true||current.testing)return;
+ current.testing=true;current.error='';current.result=null;
  render();
  try{
-  const result=await requestLocalPost('/api/ifind/test',payload);
+  const result=await requestLocalPost(MARKET_KEYS[id].path,payload);
   if(!Array.isArray(result.checks))throw Error('本地服务未返回测试明细');
-  ifindResult=result;
-  localStatus.ifind={...localStatus.ifind,configured:result.configured};
- }catch(error){ifindError=error.message}
- finally{ifindTesting=false;render()}
+  current.result=result;
+  const status=marketKeyStatus(id);
+  if(status)status.configured=result.configured;
+ }catch(error){current.error=error.message}
+ finally{current.testing=false;render()}
 }
 function localRefreshDetails(status){
  const sourceErrors=Object.entries(status?.quote_sources||{}).flatMap(([stage,sources])=>Object.entries(sources).map(([source,error])=>[stage+' · '+source,error]));
