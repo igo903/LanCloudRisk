@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """RiskLens local research server. Python stdlib only; binds loopback by default."""
 import argparse
+import base64
 import concurrent.futures
+import contextvars
 import datetime as dt
 import errno
+import hashlib
 import ipaddress
 import json
 import math
@@ -11,6 +14,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -18,8 +23,6 @@ import urllib.request
 import urllib.error
 import webbrowser
 import html
-import csv
-import io
 import sys
 import tempfile
 import struct
@@ -46,18 +49,69 @@ QUOTE = 'https://qt.gtimg.cn/q='
 SINA_QUOTE = 'https://hq.sinajs.cn/list='
 IFIND_ENDPOINT = 'https://api-mcp.51ifind.com:8643/ds-mcp-servers/hexin-ifind-ds-{}-mcp'
 MASSIVE_API = 'https://api.massive.com'
+FUTU_API = 'https://webapi.futunn.com/api/v1.0/quote'
 PINGAN_QUOTE = 'https://ai.stock.pingan.com/restapi/hangqing/adapter/hangQing/stockDynamic'
 MARKET_KEY_SETTINGS = {
+    'futu': ('富途', 'FUTU_API_KEY'),
     'massive': ('Massive', 'MASSIVE_API_KEY'),
     'pingan': ('平安证券', 'PINGAN_SKILL_APIKEY'),
 }
 MARKET_KEY_TEST_PATHS = {'/api/ifind/test': 'ifind', '/api/market-keys/massive/test': 'massive',
-                         '/api/market-keys/pingan/test': 'pingan'}
+                         '/api/market-keys/pingan/test': 'pingan', '/api/market-keys/futu/test': 'futu'}
 TOKEN = secrets.token_urlsafe(24)
 NETWORK_LIMIT = threading.BoundedSemaphore(8)
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PROXY_MODE = 'auto'
 EXTERNAL_SYMBOLS = ['usSOXX', 'usQQQ', 'usNVDA', 'usMU', 'usTSM', 'usAVGO', 'hkHSTECH', 'usVIX']
+QUOTE_TRACE = contextvars.ContextVar('quote_trace', default=None)
+QUOTE_READ_ERRORS = (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError)
+
+
+class QuoteUnavailable(ValueError):
+    pass
+
+
+def trace_quote(provider, status, detail='', *, elapsed=None):
+    scope = QUOTE_TRACE.get()
+    if scope is not None:
+        record, stage, target = scope
+        record({'stage': stage, 'target': target, 'provider': provider, 'status': status,
+                'at': now(), 'detail': detail[:300], 'elapsed_ms': elapsed})
+
+
+def traced_quote_call(record, stage, target, load, *args, **kwargs):
+    token = QUOTE_TRACE.set((record, stage, target))
+    try:
+        return load(*args, **kwargs)
+    finally:
+        QUOTE_TRACE.reset(token)
+
+
+def first_quote_source(routes, errors, *, date_of=None, not_before=None):
+    for provider, load in routes:
+        started = time.monotonic()
+        prior_errors = len(errors)
+        try:
+            result = load()
+            if not result:
+                raise ValueError('未返回可用数据')
+            if not_before and (day := date_of(result)) < not_before:
+                raise ValueError(f'最近日线 {day} 早于缓存日期 {not_before}')
+        except QUOTE_READ_ERRORS as exc:
+            status = 'skipped' if isinstance(exc, QuoteUnavailable) else 'failed'
+            message = str(exc) or type(exc).__name__
+            errors.append(f'{provider}：{message}')
+            trace_quote(provider, status, '；'.join(errors[prior_errors:-1] + [message]),
+                        elapsed=round((time.monotonic()-started)*1000))
+        else:
+            trace_quote(provider, 'ok', '；'.join(errors[prior_errors:]),
+                        elapsed=round((time.monotonic()-started)*1000))
+            return provider, result
+    raise ValueError('；'.join(errors))
+
+
+def unsupported_quote(reason):
+    raise QuoteUnavailable(reason)
 
 
 class NoMarketRedirect(urllib.request.HTTPRedirectHandler):
@@ -220,7 +274,7 @@ def ifind_token():
     config = os.environ.get('IFIND_MCP_CONFIG')
     if config:
         return read_ifind_settings(Path(config).expanduser())
-    raise ValueError('未配置本地 iFinD 密钥，请在「数据与方法」配置')
+    raise QuoteUnavailable('未配置本地 iFinD 密钥，请在「数据与方法」配置')
 
 
 def save_ifind_settings(token):
@@ -263,29 +317,42 @@ def validate_market_key(provider, value):
     return key
 
 
-def market_key(provider):
-    label, env = MARKET_KEY_SETTINGS[provider]
+def read_market_settings(provider):
     try:
         with market_key_path(provider).open(encoding='utf-8') as handle:
-            return validate_market_key(provider, json.loads(handle.read(8192))['api_key'])
+            settings = json.loads(handle.read(16384))
+            if not isinstance(settings, dict) or 'api_key' not in settings:
+                raise ValueError('密钥配置结构无效')
+            return settings
     except FileNotFoundError:
-        pass
-    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    except (OSError, ValueError):
+        label = MARKET_KEY_SETTINGS[provider][0]
         raise ValueError(f'无法读取本地 {label} 密钥配置') from None
-    if os.environ.get(env):
-        return validate_market_key(provider, os.environ[env])
-    raise ValueError(f'未配置 {label} 密钥，请在「数据与方法 → 行情密钥专区」配置')
+
+
+def market_key(provider):
+    label, env = MARKET_KEY_SETTINGS[provider]
+    settings = read_market_settings(provider)
+    if settings is not None:
+        return validate_market_key(provider, settings['api_key'])
+    token = os.environ.get(env) or (os.environ.get('FUTU_ACCESS_TOKEN') if provider == 'futu' else None)
+    if token:
+        return validate_market_key(provider, token)
+    raise QuoteUnavailable(f'未配置 {label} 密钥，请在「数据与方法 → 行情密钥专区」配置')
 
 
 def market_key_status(provider):
     try:
+        if provider == 'futu':
+            return {'configured': True, 'auth_mode': futu_credentials()['mode']}
         market_key(provider)
         return {'configured': True}
     except ValueError as exc:
         return {'configured': False, 'message': str(exc)}
 
 
-def authenticated_market_json(label, url, headers, data=None):
+def authenticated_market_json(label, url, headers, data=None, *, unauthorized_hint='请检查密钥是否有效'):
     def read(opener):
         request = urllib.request.Request(url, data=data, headers=headers)
         with opener.open(request, timeout=10) as response:
@@ -305,12 +372,22 @@ def authenticated_market_json(label, url, headers, data=None):
                 payload = read(IFIND_DIRECT)
     except urllib.error.HTTPError as exc:
         exc.close()
-        hints = {401: '请检查密钥是否有效', 403: '请检查密钥及该市场或接口的订阅权限',
+        hints = {401: unauthorized_hint, 403: '请检查密钥及该市场或接口的订阅权限',
                  429: '已达到请求额度，请稍后重试'}
         raise ValueError(f'{label} HTTP {exc.code}：{hints.get(exc.code, "行情接口请求失败")}') from None
     except OSError as exc:
         reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-        hint = '连接超时' if isinstance(reason, TimeoutError) else '网络连接失败，请检查网络或代理'
+        code = getattr(reason, 'errno', None)
+        if isinstance(reason, TimeoutError):
+            hint = '连接超时'
+        elif isinstance(reason, ConnectionRefusedError):
+            hint = '连接被拒绝，请检查网络或代理'
+        elif isinstance(reason, socket.gaierror):
+            hint = '域名解析失败，请检查 DNS 或代理'
+        else:
+            hint = '网络连接失败，请检查网络或代理'
+        if isinstance(code, int):
+            hint += f'（Errno {code}）'
         raise ValueError(f'{label}：{hint}') from None
     except (json.JSONDecodeError, UnicodeError):
         raise ValueError(f'{label} 返回了无效 JSON') from None
@@ -328,6 +405,101 @@ def massive_json(url, key=None):
     if status not in ('OK', 'DELAYED'):
         hint = '请检查密钥及该市场的订阅权限' if status in ('NOT_AUTHORIZED', 'UNAUTHORIZED') else '接口未返回成功状态'
         raise ValueError(f'Massive：{hint}')
+    return payload
+
+
+def validate_futu_credentials(settings):
+    mode, key = settings.get('mode'), settings.get('api_key')
+    if isinstance(key, str) and '-----BEGIN ' in key:
+        raise ValueError('请选 AppKey 签名模式，将私钥填入 PEM 栏，并填写对应的 AppKey ID')
+    key = validate_market_key('futu', key)
+    if mode == 'oauth':
+        return {'mode': 'oauth', 'api_key': key}
+    if mode != 'appkey':
+        raise ValueError('请选择富途认证方式')
+    pem = settings.get('private_key')
+    pem = pem.strip().replace('\r\n', '\n') if isinstance(pem, str) else ''
+    if len(pem) > 8192 or not re.fullmatch(r'-----BEGIN (PRIVATE KEY|RSA PRIVATE KEY)-----\n[\w+/=\n]+\n-----END \1-----', pem, re.ASCII):
+        raise ValueError('请粘贴完整的无口令 PEM 私钥，包含 BEGIN 和 END 两行')
+    algorithm = settings.get('algorithm')
+    if algorithm not in ('RSA-SHA256', 'Ed25519'):
+        raise ValueError('富途签名算法应为 RSA-SHA256 或 Ed25519')
+    return {'mode': mode, 'api_key': key, 'algorithm': algorithm, 'private_key': pem + '\n'}
+
+
+def futu_credentials(token=None):
+    settings = read_market_settings('futu') if token is None else None
+    if settings is not None and 'mode' in settings:
+        return validate_futu_credentials(settings)
+    signing_file = os.environ.get('FUTU_SIGNING_KEY_FILE')
+    if token is None:
+        if settings is not None:
+            token = settings['api_key']
+        else:
+            token = os.environ.get('FUTU_API_KEY')
+            if not token:
+                token = os.environ.get('FUTU_ACCESS_TOKEN')
+                signing_file = None
+        if not token:
+            raise QuoteUnavailable('未配置富途密钥，请在「数据与方法 → 行情密钥专区」配置')
+    key = validate_market_key('futu', token)
+    if signing_file:
+        return {'mode': 'appkey', 'api_key': key, 'signing_file': signing_file,
+                'algorithm': os.environ.get('FUTU_SIGNING_ALGORITHM', 'RSA-SHA256')}
+    return {'mode': 'oauth', 'api_key': key}
+
+
+def futu_headers(url, credentials, body):
+    key = credentials['api_key']
+    if credentials['mode'] == 'oauth':
+        return {'Authorization': 'Bearer ' + key}
+    algorithm = credentials['algorithm']
+    timestamp = str(time.time_ns() // 1_000_000)
+    target = urllib.parse.urlsplit(url)
+    digest = hashlib.sha256(body).hexdigest() if body is not None else ''
+    payload = '\n'.join((timestamp, 'POST' if body is not None else 'GET', target.path, target.query, digest)).encode()
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            if 'private_key' in credentials:
+                with tempfile.NamedTemporaryFile(mode='w', encoding='ascii', dir=folder, delete=False) as handle:
+                    handle.write(credentials['private_key'])
+                    path = handle.name
+            else:
+                path = str(Path(credentials['signing_file']).expanduser().resolve())
+            if algorithm == 'RSA-SHA256':
+                command = ['openssl', 'dgst', '-sha256', '-sign', path, '-passin', 'pass:']
+            elif algorithm == 'Ed25519':
+                message = Path(folder) / 'request'
+                message.write_bytes(payload)
+                command = ['openssl', 'pkeyutl', '-sign', '-rawin', '-inkey', path, '-passin', 'pass:', '-in', str(message)]
+            else:
+                raise ValueError('富途签名算法应为 RSA-SHA256 或 Ed25519')
+            signature = subprocess.run(command, input=payload if algorithm == 'RSA-SHA256' else None,
+                                       capture_output=True, check=True, timeout=5).stdout
+    except FileNotFoundError:
+        raise QuoteUnavailable('富途 AppKey 无法签名，请在部署端安装 OpenSSL 3') from None
+    except (OSError, subprocess.SubprocessError):
+        raise QuoteUnavailable('富途 AppKey 无法签名，请检查 PEM 私钥和签名算法是否匹配') from None
+    return {'X-Api-Key': key, 'Authorization': base64.b64encode(signature).decode('ascii'),
+            'X-Timestamp': timestamp, 'X-Nonce': secrets.token_hex(16)}
+
+
+def futu_json(url, key=None, data=None):
+    body = json.dumps(data, separators=(',', ':')).encode() if data is not None else None
+    credentials = futu_credentials() if key is None else key
+    headers = futu_headers(url, credentials, body)
+    hint = ('请检查 AppKey ID 是否已启用，控制台公钥是否与私钥匹配，以及服务端时钟'
+            if credentials['mode'] == 'appkey' else '请检查 OAuth 访问令牌是否有效或过期。AppKey 请用签名模式')
+    payload = authenticated_market_json('富途', url, {**headers, 'Accept': 'application/json',
+                                                       'Content-Type': 'application/json'}, body, unauthorized_hint=hint)
+    code = payload.get('ret_code')
+    if code not in (0, '0'):
+        reason = {'-7': '标的未识别', '-8': '接口不支持此市场或品种', '-9': '行情权限不足',
+                  '-10': '无数据', '-11': '触发限频', '-12': '历史行情额度不足',
+                  '-12006': '请求时间偏差过大，请校准部署端时钟',
+                  '-12102': '访问令牌已过期'}.get(str(code), '行情接口返回业务错误')
+        safe_code = str(code) if re.fullmatch(r'-?\d{1,9}', str(code)) else '未知'
+        raise ValueError(f'富途 {safe_code}：{reason}')
     return payload
 
 
@@ -564,13 +736,29 @@ def test_ifind_connection(payload):
 
 
 def test_market_key(provider, payload):
-    has_new_key = 'token' in payload
-    key = validate_market_key(provider, payload['token']) if has_new_key else market_key(provider)
+    has_new_key = 'token' in payload or (provider == 'futu' and 'mode' in payload)
+    settings = None
+    if provider == 'futu':
+        if has_new_key and 'mode' in payload:
+            settings = validate_futu_credentials({**payload, 'api_key': payload.get('token')})
+            key = settings
+        elif has_new_key:
+            token = validate_futu_credentials({'mode': 'oauth', 'api_key': payload.get('token')})['api_key']
+            key = futu_credentials(token)
+            settings = {'api_key': token}
+        else:
+            key = futu_credentials()
+    else:
+        key = validate_market_key(provider, payload['token']) if has_new_key else market_key(provider)
+        settings = {'api_key': key}
     lock = MARKET_KEY_LOCKS[provider]
     if not lock.acquire(blocking=False):
         raise RuntimeError(f'{MARKET_KEY_SETTINGS[provider][0]} 正在测试，请稍后重试')
     try:
-        if provider == 'massive':
+        if provider == 'futu':
+            probes = [(label, ticker, lambda ticker=ticker: futu_test_quote(ticker, key))
+                      for label, ticker in (('美股', 'US.AAPL'), ('港股', 'HK.00700'))]
+        elif provider == 'massive':
             probes = [(label, ticker, lambda ticker=ticker: massive_test_quote(ticker, key))
                       for label, ticker in (('美股', 'AAPL'), ('费城半导体指数', 'I:SOX'), ('比特币', 'X:BTCUSD'))]
         else:
@@ -587,8 +775,8 @@ def test_market_key(provider, payload):
         saved, save_error = False, None
         if passed and has_new_key:
             try:
-                save_private_settings(market_key_path(provider), {'api_key': key})
-                if provider == 'massive':
+                save_private_settings(market_key_path(provider), settings)
+                if provider in ('futu', 'massive'):
                     with SEARCH_LOCK:
                         SEARCH_CACHE.clear()
                 saved = True
@@ -626,7 +814,10 @@ def load_cn_quotes(symbols, *, issues=None, minimum=None, require_bar=False):
     for name, load in sources:
         if not remaining:
             break
+        started = time.monotonic()
+        requested = len(remaining)
         failures = []
+        unavailable = False
         invalid_identity = invalid_time = 0
         try:
             result = load(list(remaining), failures)
@@ -660,6 +851,11 @@ def load_cn_quotes(symbols, *, issues=None, minimum=None, require_bar=False):
                 failures.append(f'{invalid_time} 个标的报价时间缺失、过旧或晚于当前时间')
         except (OSError, ValueError) as exc:
             failures.append(str(exc)[:165])
+            unavailable = isinstance(exc, QuoteUnavailable)
+        accepted = requested - len(remaining)
+        status = 'skipped' if unavailable else 'partial' if accepted and failures else 'ok' if accepted else 'failed'
+        trace_quote(name, status, f'有效标的 {accepted}/{requested}' + ('；' + '；'.join(failures) if failures else ''),
+                    elapsed=round((time.monotonic()-started)*1000))
         if failures:
             errors[name] = '；'.join(failures)
     if issues is not None:
@@ -734,6 +930,7 @@ def load_asset(asset, quotes, previous=None):
         ('腾讯日线', TENCENT + '?' + urllib.parse.urlencode({'param': symbol + ',day,,,640,'})),
     ]
     for provider, url in sources:
+        started = time.monotonic()
         try:
             body = fetch(url)
             rows = parse_sina(body) if provider == '新浪日线' else parse_tencent(body, symbol)
@@ -742,6 +939,8 @@ def load_asset(asset, quotes, previous=None):
             # only ratios use this field. No absolute share-volume calculations are exposed.
             unit = '股/份' if provider == '新浪日线' else '供应商原始单位（仅计算量比）'
             quote_source = quote.get('source', '腾讯公开行情')
+            trace_quote(provider, 'ok', f'{len(bars)} 根有效日线，最新 {bars[-1]["date"]}',
+                        elapsed=round((time.monotonic()-started)*1000))
             return code, {'source': f'{provider}（未复权）+ {quote_source}名称核验', 'as_of': bars[-1]['date'],
                           'adjustment': 'none', 'completed': bars[-1]['completed'], 'bars': bars,
                           'fundamentals': None, 'fetched_at': now(), 'latest_quote': quote,
@@ -750,6 +949,7 @@ def load_asset(asset, quotes, previous=None):
                           'fallback_errors': errors}
         except Exception as exc:
             errors.append(provider + ': ' + str(exc)[:160])
+            trace_quote(provider, 'failed', str(exc), elapsed=round((time.monotonic()-started)*1000))
     raise ValueError('；'.join(errors))
 
 
@@ -1100,27 +1300,28 @@ GLOBAL_ASSETS = [
 ]
 
 
-# Match the instrument itself and the market ID, including COMEX continuous contracts.
-EASTMONEY_EXTERNAL = {
-    'DXY': '100.UDI', 'CNH': '133.USDCNH', 'DJI': '100.DJIA', 'IXIC': '100.NDX',
-    'N225': '100.N225', 'KOSPI': '100.KS11', 'A50': '100.XIN9', 'GOLD': '101.GC00Y',
-    'SILVER': '101.SI00Y', 'usSOXX': '105.SOXX', 'usQQQ': '105.QQQ', 'usNVDA': '105.NVDA',
-    'usMU': '105.MU', 'usTSM': '106.TSM', 'usAVGO': '105.AVGO',
+# Explicit provider symbols preserve the underlying instrument and quotation basis.
+FUTU_EXTERNAL = {
+    'hkHSTECH': ('HK.800700', 'Asia/Hong_Kong'), 'N225': ('JP.N225', 'Asia/Tokyo'),
+    'BTC': ('CC.BTCUSD', 'UTC'), 'usVIX': ('US.VIX', 'America/New_York'),
+    'DJI': ('US..DJI', 'America/New_York'), 'IXIC': ('US..IXIC', 'America/New_York'),
+    'SOX': ('US..SOX', 'America/New_York'),
 }
-EXTERNAL_TIMEZONES = {
-    'N225': 'Asia/Tokyo', 'KOSPI': 'Asia/Seoul', 'hkHSTECH': 'Asia/Hong_Kong',
-    'A50': 'Asia/Shanghai', 'CNH': 'Asia/Shanghai', 'BTC': 'UTC',
+MASSIVE_EXTERNAL = {
+    'SOX': 'I:SOX', 'BTC': 'X:BTCUSD', 'CNH': 'C:USDCNH',
+    'DJI': 'I:DJI', 'IXIC': 'I:COMP', 'usVIX': 'I:VIX',
 }
 YAHOO_CHART_HOSTS = ('query1.finance.yahoo.com', 'query2.finance.yahoo.com')
 
 
-def massive_day(instant, timezone):
+def quote_day(instant, timezone):
     try:
         from zoneinfo import ZoneInfo
         return instant.astimezone(ZoneInfo(timezone)).date()
     except (ImportError, KeyError):
-        if timezone == 'UTC':
-            return instant.astimezone(dt.timezone.utc).date()
+        fixed_hours = {'UTC': 0, 'Asia/Hong_Kong': 8, 'Asia/Shanghai': 8, 'Asia/Tokyo': 9, 'Asia/Seoul': 9}
+        if timezone in fixed_hours:
+            return instant.astimezone(dt.timezone(dt.timedelta(hours=fixed_hours[timezone]))).date()
         # Standalone Python on Windows may lack IANA data. The recent US window is post-2007.
         year = instant.astimezone(dt.timezone.utc).year
         march = dt.datetime(year, 3, 8, 7, tzinfo=dt.timezone.utc)
@@ -1133,7 +1334,7 @@ def massive_day(instant, timezone):
 def massive_daily(ticker, key=None, days=720, current=None):
     timezone = 'UTC' if ticker.startswith('X:') else 'America/New_York'
     current = current or dt.datetime.now(dt.timezone.utc)
-    today = massive_day(current, timezone)
+    today = quote_day(current, timezone)
     start = today - dt.timedelta(days=days)
     url = f'{MASSIVE_API}/v2/aggs/ticker/{urllib.parse.quote(ticker, safe=":")}/range/1/day/{start}/{today}'
     url += '?adjusted=true&sort=asc&limit=5000'
@@ -1146,7 +1347,7 @@ def massive_daily(ticker, key=None, days=720, current=None):
         if not isinstance(item, dict) or type(item.get('t')) is not int:
             continue
         try:
-            day = massive_day(dt.datetime.fromtimestamp(item['t'] / 1000, dt.timezone.utc), timezone)
+            day = quote_day(dt.datetime.fromtimestamp(item['t'] / 1000, dt.timezone.utc), timezone)
         except (OverflowError, OSError, ValueError):
             continue
         prices = {field: number(item.get(key)) for field, key in (
@@ -1157,6 +1358,58 @@ def massive_daily(ticker, key=None, days=720, current=None):
     if not rows:
         raise ValueError('Massive 未返回可核验的日线')
     return [rows[day] for day in sorted(rows)], url, timezone, payload['status'] == 'DELAYED'
+
+
+def futu_daily(ticker, timezone, *, key=None, days=720, adjusted=True, current=None):
+    current = current or dt.datetime.now(dt.timezone.utc)
+    today = quote_day(current, timezone)
+    start = today - dt.timedelta(days=days)
+    endpoint = f'{FUTU_API}/{urllib.parse.quote(ticker, safe="")}/history-kline'
+    query = {'start': start, 'end': today, 'ktype': 2, 'autype': int(adjusted), 'num': 370, 'extended_time': 0}
+    cursor, rows = {}, {}
+    for _ in range(2):
+        response = futu_json(endpoint + '?' + urllib.parse.urlencode({**query, **cursor}), key)
+        data = response.get('data') or {}
+        items = data.get('kline_list')
+        precision = data.get('volume_precision', 0)
+        scale = 10**precision if type(precision) is int and 0 <= precision <= 12 else None
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict) or item.get('code', ticker) != ticker:
+                continue
+            try:
+                date = str(item.get('date', ''))
+                if re.fullmatch(r'\d{8}', date):
+                    day = dt.date(int(date[:4]), int(date[4:6]), int(date[6:]))
+                else:
+                    instant = dt.datetime.fromtimestamp(int(item['time_key']) / 1000, dt.timezone.utc)
+                    day = quote_day(instant, timezone)
+            except (TypeError, ValueError, OverflowError, OSError, KeyError):
+                continue
+            prices = {field: number(item.get(field)) for field in ('open', 'high', 'low', 'close')}
+            if start <= day <= today and prices['close'] is not None and prices['close'] > 0:
+                volume = number(item.get('volume'))
+                rows[day] = {'date': day.isoformat(), **prices,
+                             'vol': volume / scale if scale and volume is not None else None,
+                             'completed': day < today}
+        pagination = response.get('pagination') or {}
+        if not pagination.get('has_more') or days <= 10:
+            break
+        page_token = pagination.get('next_page_token')
+        next_time = data.get('next_time')
+        if page_token:
+            query.pop('end', None)
+        cursor = {'page_token': page_token} if page_token else {'next_time': next_time}
+        if not page_token and not next_time:
+            break
+    if not rows:
+        raise ValueError('富途未返回可核验的日线')
+    return [rows[day] for day in sorted(rows)], endpoint
+
+
+def futu_test_quote(ticker, key):
+    timezone = 'Asia/Hong_Kong' if ticker.startswith('HK.') else 'America/New_York'
+    rows, _ = futu_daily(ticker, timezone, key=key, days=10)
+    return {'price': rows[-1]['close'], 'timestamp': rows[-1]['date'], 'detail': '日线数据'}
 
 
 def massive_test_quote(ticker, key):
@@ -1174,26 +1427,19 @@ def load_massive_global(ticker):
 
 
 def read_yahoo_chart(ticker, query, parse, errors):
+    failures = []
     for host in YAHOO_CHART_HOSTS:
         url = f'https://{host}/v8/finance/chart/{urllib.parse.quote(ticker, safe="")}?{query}'
         try:
             result = json.loads(fetch(url))['chart']['result'][0]
             if result['meta']['symbol'].upper() != ticker.upper():
                 raise ValueError('标的身份不匹配')
-            return parse(result), url
+            parsed = parse(result)
+            errors.extend(failures)
+            return parsed, url
         except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError) as exc:
-            errors.append(f'Yahoo Finance {host.split(".")[0]}：{str(exc)[:130]}')
-    raise ValueError('；'.join(errors))
-
-
-def fetch_json_history(url):
-    # One retry for transient upstream gateway failures; never retry auth or rate-limit errors.
-    for attempt in range(2):
-        try:
-            return json.loads(fetch(url))
-        except urllib.error.HTTPError as exc:
-            if attempt or exc.code not in (502, 503, 504):
-                raise
+            failures.append(f'{host.split(".")[0]}：{str(exc)[:130]}')
+    raise ValueError('；'.join(failures))
 
 
 def external_changes(history, kind):
@@ -1244,88 +1490,37 @@ def parse_yahoo_global(result, kind):
             and (kind == 'crypto' or session.get('start', 1e20) <= current.timestamp() < session.get('end', 0))}
 
 
-def external_backup(symbol):
-    if symbol in EASTMONEY_EXTERNAL:
-        secid = EASTMONEY_EXTERNAL[symbol]
-        query = urllib.parse.urlencode({'secid': secid, 'klt': 101, 'fqt': 0, 'lmt': 600, 'beg': 0,
-                                        'end': 20500101, 'fields1': 'f1,f2,f3,f4,f5,f6',
-                                        'fields2': 'f51,f52,f53,f54,f55,f56,f57'})
-        return '东方财富', 'https://push2his.eastmoney.com/api/qt/stock/kline/get?' + query
-    if symbol == 'SOX':
-        start = (dt.datetime.now(TZ).date() - dt.timedelta(days=760)).isoformat()
-        return 'Nasdaq', f'https://api.nasdaq.com/api/quote/SOX/historical?assetclass=index&fromdate={start}&limit=600'
-    return {
-        'hkHSTECH': ('腾讯', 'https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get?param=hkHSTECH,day,,,600,qfq'),
-        'US10Y': ('FRED', 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10'),
-        'usVIX': ('Cboe', 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'),
-        'BTC': ('Coinbase', 'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=86400'),
-    }[symbol]
+def load_futu_global(symbol, ticker, stock):
+    mapping = ('US.' + ticker, 'America/New_York') if stock else FUTU_EXTERNAL.get(symbol)
+    if mapping is None:
+        return unsupported_quote('富途暂无可核验的同一标的代码')
+    qualified, timezone = mapping
+    rows, url = futu_daily(qualified, timezone, adjusted=stock)
+    last = rows[-1]
+    return {'history': [{'date': b['date'], 'close': b['close']} for b in rows],
+            'timestamp': last['date'], 'timezone': timezone, 'provisional': not last['completed']}, url
 
 
-def read_alternate_global(symbol, provider, url):
-    closed_feed = provider in ('FRED', 'Cboe', 'Nasdaq')
-    timezone = EXTERNAL_TIMEZONES.get(symbol, 'America/New_York')
-    current = dt.datetime.now(market_timezone({'exchangeTimezoneName': timezone}))
-    today = current.date().isoformat()
-    if provider == '东方财富':
-        market, code = EASTMONEY_EXTERNAL[symbol].split('.')
-        payload = fetch_json_history(url)['data']
-        if not payload or payload['code'] != code or str(payload.get('market')) != market:
-            raise ValueError('跨市场历史标的身份不匹配')
-        points = ((cells[0], cells[2]) for cells in (row.split(',') for row in payload['klines']) if len(cells) >= 3)
-    elif provider == '腾讯':
-        payload = json.loads(fetch(url))['data']['hkHSTECH']
-        points = ((r[0], r[2]) for r in payload['day'] if len(r) >= 3)
-    elif provider == 'Nasdaq':
-        payload = json.loads(fetch(url))['data']
-        if not payload or payload['symbol'] != 'SOX':
-            raise ValueError('费城半导体指数身份不匹配')
-        points = ((dt.datetime.strptime(r['date'], '%m/%d/%Y').date().isoformat(), r['close'].replace(',', ''))
-                  for r in payload['tradesTable']['rows'])
-    elif provider == 'Coinbase':
-        rows = json.loads(fetch(url))
-        points = ((dt.datetime.fromtimestamp(r[0], dt.timezone.utc).date().isoformat(), r[4]) for r in rows if len(r) >= 5)
-    else:
-        reader = csv.DictReader(io.StringIO(fetch(url).decode('utf-8-sig')))
-        if provider == 'FRED':
-            points = ((r['observation_date'], r['DGS10']) for r in reader)
-        else:
-            points = ((dt.datetime.strptime(r['DATE'], '%m/%d/%Y').date().isoformat(), r['CLOSE']) for r in reader)
-    history = global_history(points, today)
-    last = history[-1]['date']
-    return {'history': history, 'timestamp': last, 'timezone': timezone, 'provisional': not closed_feed and last == today}
-
-
-def load_global_asset(asset):
+def load_global_asset(asset, not_before=None):
     symbol, name, ticker, unit, kind, weight = asset
     yahoo_link = 'https://finance.yahoo.com/quote/' + urllib.parse.quote(ticker, safe='') + '/'
-    massive_ticker = {'SOX': 'I:SOX', 'BTC': 'X:BTCUSD'}.get(symbol)
-    if symbol.startswith('us') and kind == 'equity':
-        massive_ticker = ticker
+    stock = symbol.startswith('us') and kind == 'equity'
+    massive_ticker = ticker if stock else MASSIVE_EXTERNAL.get(symbol)
     row = {'symbol': symbol, 'name': name, 'ticker': ticker, 'unit': unit, 'kind': kind, 'weight': RISK_WEIGHTS.get(symbol, weight),
-           'url': 'https://massive.com/' if massive_ticker else yahoo_link, 'fetched_at': now()}
+           'url': yahoo_link, 'fetched_at': now()}
     errors = []
-    record, url, provider = None, None, 'Massive' if massive_ticker else 'Yahoo Finance'
+    routes = (
+        ('富途', lambda: load_futu_global(symbol, ticker, stock)),
+        ('Yahoo Finance', lambda: read_yahoo_chart(ticker, 'range=2y&interval=1d',
+                                                 lambda data: parse_yahoo_global(data, kind), errors)),
+        ('Massive', lambda: load_massive_global(massive_ticker) if massive_ticker else
+         unsupported_quote('Massive 暂无可核验的同一标的代码')),
+    )
     try:
-        if massive_ticker:
-            record, url = load_massive_global(massive_ticker)
-        else:
-            record, url = read_yahoo_chart(ticker, 'range=2y&interval=1d', lambda result: parse_yahoo_global(result, kind), errors)
+        provider, (record, url) = first_quote_source(
+            routes, errors, date_of=lambda result: result[0]['history'][-1]['date'], not_before=not_before)
     except ValueError as exc:
-        if massive_ticker:
-            errors.append(str(exc))
-    if record is None or (symbol in ('A50', 'CNH', 'hkHSTECH') and len(record['history']) < 251):
-        backup_provider, backup_url = external_backup(symbol)
-        try:
-            backup = read_alternate_global(symbol, backup_provider, backup_url)
-            # Keep each return window on one provider's price series.
-            if record is None or (backup['history'][-1]['date'] >= record['history'][-1]['date']
-                                  and len(backup['history']) > len(record['history'])):
-                record, url, provider = backup, backup_url, backup_provider
-        except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, OverflowError) as exc:
-            errors.append(f'{backup_provider}：{str(exc)[:150]}')
-    if record is None:
-        return {**row, 'error': '；'.join(errors), 'price': None, 'history': [], 'returns': external_changes([], kind), 'stale': True}
+        return {**row, 'error': str(exc), 'price': None, 'history': [], 'returns': external_changes([], kind), 'stale': True}
     history = record['history']
     last = history[-1]['date']
     basis = ' 日频收益率' if kind == 'yield' else ' 日频价格（非总回报）'
@@ -1367,9 +1562,18 @@ def merge_external(previous, current):
     return output
 
 
-def load_external():
+def load_external(previous=()):
+    scope = QUOTE_TRACE.get()
+    dates = {row['symbol']: row.get('history_as_of') for row in previous}
+
+    def load(asset):
+        if scope is None:
+            return load_global_asset(asset, dates.get(asset[0]))
+        record, stage, _ = scope
+        return traced_quote_call(record, stage, asset[0], load_global_asset, asset, dates.get(asset[0]))
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-        return list(pool.map(load_global_asset, GLOBAL_ASSETS))
+        return list(pool.map(load, GLOBAL_ASSETS))
 
 
 QUOTE_PROVIDER_NAMES = {'腾讯公开行情': '腾讯', '新浪公开行情': '新浪', '同花顺 iFinD Level 1': '同花顺 iFinD'}
@@ -1513,6 +1717,91 @@ def parse_security_search(raw, market='ALL'):
     return rows
 
 
+def foreign_security(market, symbol, name, kind, provider):
+    if market not in ('US', 'HK') or kind not in ('stock', 'etf') or not isinstance(symbol, str):
+        return None
+    if not isinstance(name, str) or not name.strip() or re.search(r'[<>\x00-\x1f]', name):
+        return None
+    try:
+        code = asset_id(market, symbol.replace('.', '-') if market == 'US' else symbol)
+    except ValueError:
+        return None
+    return {'code': code, 'symbol': code.split('.', 1)[1], 'name': name.strip()[:100],
+            'market': market, 'type': kind, 'currency': 'HKD' if market == 'HK' else 'USD',
+            'timezone': 'Asia/Hong_Kong' if market == 'HK' else 'America/New_York',
+            'provider_symbol': symbol, 'search_source': provider, 'watch': False, 'benchmark': False}
+
+
+def futu_security(row):
+    ticker = row.get('code')
+    if not isinstance(ticker, str) or '.' not in ticker or row.get('state') in ('DELISTED', 'EXPIRED'):
+        return None
+    market, symbol = ticker.split('.', 1)
+    kind = {'STOCK': 'stock', 'ETF': 'etf'}.get(str(row.get('stock_type', row.get('sec_type'))).upper())
+    return foreign_security(market, symbol, row.get('sc_name') or row.get('name'), kind, '富途')
+
+
+def futu_basic_info(codes):
+    result = futu_json(FUTU_API + '/stock-basicinfo', data={'code_list': codes})
+    return (result.get('data') or {}).get('basic_list') or []
+
+
+def search_futu_securities(query, market):
+    query = urllib.parse.urlencode({'keyword': query, 'page_size': 30})
+    result = futu_json(FUTU_API + '/search-quote?' + query)
+    candidates = (result.get('data') or {}).get('items') or []
+    parsed, unknown = {}, []
+    for row in candidates:
+        code = row.get('code')
+        if not isinstance(code, str) or code.split('.', 1)[0] not in ('US', 'HK'):
+            continue
+        if market != 'ALL' and not code.startswith(market + '.'):
+            continue
+        meta = futu_security(row)
+        if meta:
+            parsed[meta['code']] = meta
+        elif type(row.get('sec_type')) is int:
+            unknown.append(code)
+    if unknown:
+        for row in futu_basic_info(unknown):
+            meta = futu_security(row)
+            if meta and row.get('code') in unknown:
+                parsed[meta['code']] = meta
+    return list(parsed.values())
+
+
+YAHOO_US_EXCHANGES = {'NMS', 'NGM', 'NCM', 'NAS', 'NYQ', 'ASE', 'PCX', 'BTS', 'BATS', 'PNK', 'OQB', 'OQX'}
+
+
+def search_yahoo_securities(query, market, errors):
+    params = urllib.parse.urlencode({'q': query, 'quotesCount': 25, 'newsCount': 0})
+    failures = []
+    for host in YAHOO_CHART_HOSTS:
+        try:
+            response = json_get(f'https://{host}/v1/finance/search?{params}')
+            results = {}
+            for row in response.get('quotes', []):
+                ticker, exchange = row.get('symbol', ''), row.get('exchange')
+                row_market = 'HK' if exchange == 'HKG' and re.fullmatch(r'\d{1,5}\.HK', ticker) else None
+                if exchange in YAHOO_US_EXCHANGES and re.fullmatch(r'[A-Z][A-Z0-9.-]{0,14}', ticker):
+                    row_market = 'US'
+                if row_market is None or market not in ('ALL', row_market):
+                    continue
+                kind = {'EQUITY': 'stock', 'ETF': 'etf'}.get(row.get('quoteType'))
+                symbol = ticker.split('.')[0] if row_market == 'HK' else ticker
+                meta = foreign_security(row_market, symbol, row.get('longname') or row.get('shortname'), kind, 'Yahoo Finance')
+                if meta:
+                    meta['provider_symbol'] = ticker
+                    results[meta['code']] = meta
+            if results:
+                errors.extend(failures)
+                return list(results.values())
+            failures.append(f'{host.split(".")[0]} 未找到匹配的股票或 ETF')
+        except QUOTE_READ_ERRORS as exc:
+            failures.append(f'{host.split(".")[0]}：{str(exc)[:130]}')
+    raise ValueError('；'.join(failures))
+
+
 def search_securities(query, market='ALL'):
     if market not in ('ALL', 'CN', 'HK', 'US'):
         raise ValueError('不支持的市场')
@@ -1524,33 +1813,35 @@ def search_securities(query, market='ALL'):
         cached = SEARCH_CACHE.get(key)
         if cached and time.monotonic() - cached[0] < 180:
             return [dict(x) for x in cached[1]]
-    rows, errors, aliases = [], [], []
-    localized = bool(re.search(r'[\u3400-\u9fff]', query))
-    if market in ('ALL', 'CN', 'HK') or localized:
+    rows, errors = [], []
+    if market in ('ALL', 'CN'):
         url = 'https://smartbox.gtimg.cn/s3/?' + urllib.parse.urlencode({'q': query, 't': 'all'})
         try:
-            for row in parse_security_search(fetch(url), market):
-                (aliases if row['market'] == 'US' else rows).append(row)
+            rows = parse_security_search(fetch(url), 'CN')
         except (OSError, ValueError) as exc:
-            if market != 'US':
-                errors.append(f'腾讯证券搜索：{exc}')
-    if market == 'US' or market == 'ALL' and not re.fullmatch(r'\d{1,6}(?:\.HK)?', query, re.I):
-        try:
-            if localized and aliases:
-                alias = next((row for row in aliases if row['name'] == query), aliases[0])
-                rows.extend(row for row in search_massive_securities(alias['symbol']) if row['code'] == alias['code'])
-            else:
-                rows.extend(search_massive_securities(query))
-        except ValueError as exc:
-            errors.append(str(exc))
-    if errors:
-        if rows:
-            return rows
+            errors.append(f'腾讯证券搜索：{exc}')
+    if market != 'CN':
+        overseas_market = 'HK' if market == 'ALL' and re.fullmatch(r'\d{1,5}(?:\.HK)?', query, re.I) else market
+        if not (market == 'ALL' and re.fullmatch(r'\d{6}', query)):
+            routes = (
+                ('富途', lambda: search_futu_securities(query, overseas_market)),
+                ('Yahoo Finance', lambda: search_yahoo_securities(query, overseas_market, errors)),
+                ('Massive', lambda: search_massive_securities(query) if overseas_market != 'HK' else
+                 unsupported_quote('Massive 股票接口不覆盖港股')),
+            )
+            try:
+                _, overseas = first_quote_source(routes, errors)
+                rows.extend(overseas)
+            except ValueError:
+                if not rows:
+                    raise
+    if not rows and errors:
         raise ValueError('；'.join(errors))
-    with SEARCH_LOCK:
-        if len(SEARCH_CACHE) > 200:
-            SEARCH_CACHE.clear()
-        SEARCH_CACHE[key] = (time.monotonic(), rows)
+    if rows:
+        with SEARCH_LOCK:
+            if len(SEARCH_CACHE) > 200:
+                SEARCH_CACHE.clear()
+            SEARCH_CACHE[key] = (time.monotonic(), rows)
     return rows
 
 
@@ -1584,39 +1875,72 @@ def search_massive_securities(query):
     return sorted(rows.values(), key=lambda meta: meta['provider_symbol'] != query.upper())
 
 
+def resolve_futu_security(market, symbol, code):
+    ticker = f'{market}.{symbol}'
+    codes = [ticker]
+    if market == 'US' and '-' in symbol:
+        codes.append(ticker.replace('-', '.'))
+    for row in futu_basic_info(codes):
+        meta = futu_security(row)
+        if meta and meta['code'] == code and row.get('code') in codes:
+            return meta
+    raise ValueError('富途未核验该股票或 ETF')
+
+
+def resolve_yahoo_security(market, symbol, errors):
+    ticker = yahoo_symbol({'market': market, 'symbol': symbol})
+
+    def verify(row):
+        meta = row['meta']
+        currency = 'HKD' if market == 'HK' else 'USD'
+        kind = {'EQUITY': 'stock', 'ETF': 'etf'}.get(meta.get('instrumentType'))
+        exchanges = {'HKG'} if market == 'HK' else YAHOO_US_EXCHANGES
+        if meta.get('currency') != currency or meta.get('exchangeName') not in exchanges:
+            raise ValueError('标的市场或币种不匹配')
+        name = meta.get('longName') or meta.get('shortName')
+        result = foreign_security(market, symbol, name, kind, 'Yahoo Finance')
+        if not result:
+            raise ValueError('Yahoo 未核验该股票或 ETF')
+        result['provider_symbol'] = ticker
+        return result
+
+    result, _ = read_yahoo_chart(ticker, 'range=5d&interval=1d', verify, errors)
+    return result
+
+
+def resolve_massive_security(market, symbol, code):
+    if market != 'US':
+        return unsupported_quote('Massive 股票接口不覆盖港股')
+    ticker = symbol.replace('-', '.')
+    url = f'{MASSIVE_API}/v3/reference/tickers/{urllib.parse.quote(ticker, safe="")}'
+    meta = massive_security(massive_json(url).get('results'))
+    if not meta or meta['code'] != code or meta['provider_symbol'] != ticker:
+        raise ValueError('Massive 未核验该股票或 ETF')
+    return meta
+
+
 def resolve_security(market, symbol):
     market = str(market).upper()
-    code = asset_id(market, symbol)
-    search_symbol = code.split('.', 1)[1] if market != 'CN' else code
     if market == 'US':
-        ticker = search_symbol.replace('-', '.')
-        candidates = search_securities(ticker, 'US')
-        meta = next((r for r in candidates if r['provider_symbol'] == ticker), None)
-        if not meta:
-            url = f'{MASSIVE_API}/v3/reference/tickers/{urllib.parse.quote(ticker, safe="")}'
-            meta = massive_security(massive_json(url).get('results'))
-        if not meta or meta['provider_symbol'] != ticker:
-            raise ValueError('Massive 未确认该美元股票或 ETF，请从美股搜索结果添加')
-        return {**meta, 'watch': True, 'verified_at': now(), 'verified_name': meta['name']}
-    candidates = search_securities(search_symbol, market)
-    meta = next((r for r in candidates if r['code'] == code), None)
-    if not meta:
-        raise ValueError('证券搜索源未确认该标的；请从搜索结果添加')
-    meta = dict(meta)
+        symbol = str(symbol).replace('.', '-')
+    code = asset_id(market, symbol)
     if market == 'CN':
+        candidates = search_securities(code, market)
+        meta = next((dict(row) for row in candidates if row['code'] == code), None)
+        if not meta:
+            raise ValueError('证券搜索源未确认该标的；请从搜索结果添加')
         quote = load_cn_quotes([meta['provider_symbol']]).get(meta['provider_symbol'])
         if not quote or quote['code'] != code or quote['name'] != meta['name']:
             raise ValueError('证券名称与报价源核验不一致')
     else:
-        symbol = yahoo_symbol(meta)
-        result, _ = read_yahoo_chart(symbol, 'range=5d&interval=1d', lambda row: row['meta'], [])
-        if result.get('symbol', '').upper() != symbol.upper() or result.get('instrumentType') not in ('EQUITY', 'ETF'):
-            raise ValueError('海外行情源未确认股票/ETF身份')
-        if market == 'HK' and result.get('exchangeName') != 'HKG':
-            raise ValueError('港股交易所核验失败')
-        meta.update(currency=result.get('currency') or meta['currency'], provider_symbol=symbol,
-                    type='etf' if result['instrumentType'] == 'ETF' else 'stock',
-                    timezone=result.get('exchangeTimezoneName'), verified_name=result.get('longName') or result.get('shortName'))
+        symbol = code.split('.', 1)[1]
+        errors = []
+        _, meta = first_quote_source((
+            ('富途', lambda: resolve_futu_security(market, symbol, code)),
+            ('Yahoo Finance', lambda: resolve_yahoo_security(market, symbol, errors)),
+            ('Massive', lambda: resolve_massive_security(market, symbol, code)),
+        ), errors)
+        meta['verified_name'] = meta['name']
     meta.update(watch=True, verified_at=now(), benchmark=code in BENCHMARK_CODES if market == 'CN' else False)
     return meta
 
@@ -1677,20 +2001,28 @@ def parse_international_chart(result, identity, current=None):
 
 
 def load_international_asset(meta, previous=None):
-    if meta['market'] == 'US':
-        record = load_massive_stock(meta)
-    else:
-        errors = []
+    errors = []
+
+    def yahoo():
         record, url = read_yahoo_chart(yahoo_symbol(meta), 'range=5y&interval=1d&includePrePost=false',
                                        lambda result: parse_international_chart(result, meta), errors)
-        record.update(provider_url=url, history_provider='Yahoo Finance', fallback_errors=errors)
+        return {**record, 'provider_url': url, 'history_provider': 'Yahoo Finance'}
+
+    _, record = first_quote_source((
+        ('富途', lambda: load_futu_stock(meta)),
+        ('Yahoo Finance', yahoo),
+        ('Massive', lambda: load_massive_stock(meta) if meta['market'] == 'US' else
+         unsupported_quote('Massive 股票接口不覆盖港股')),
+    ), errors, date_of=lambda result: result['as_of'], not_before=(previous or {}).get('as_of'))
+    record['fallback_errors'] = errors
     prior_dates = [b['date'] for b in record['bars'] if b['completed']]
+    comparable = previous if (previous or {}).get('history_provider') == record['history_provider'] else None
     # Re-fetching all daily bars repairs the last previously-provisional trading session.
-    target = max((b['date'] for b in (previous or {}).get('bars', []) if b.get('completed') is False and any(x['date'] == b['date'] and x['completed'] for x in record['bars'])), default=None)
+    target = max((b['date'] for b in (comparable or {}).get('bars', []) if b.get('completed') is False and any(x['date'] == b['date'] and x['completed'] for x in record['bars'])), default=None)
     if not target:
         target = prior_dates[-2] if record['completed'] and len(prior_dates)>1 else prior_dates[-1] if prior_dates else None
     if target:
-        verify_previous(record, previous, target)
+        verify_previous(record, comparable, target)
     record['research_errors'] = {'flows': '该海外数据源未提供与A股可比的历史大单净额',
                                  'announcements': '海外公告原文索引尚未接入，不把缺失视为无风险'}
     for key in ('fundamentals', 'financial_history'):
@@ -1700,12 +2032,8 @@ def load_international_asset(meta, previous=None):
     return meta['code'], record
 
 
-def load_massive_stock(meta):
-    # Existing catalog entries used Yahoo's dash for share classes, while Massive uses a dot.
-    ticker = (meta.get('provider_symbol') or meta['symbol']).replace('-', '.')
-    daily, url, timezone, delayed = massive_daily(ticker)
+def daily_stock_record(meta, daily, url, timezone, provider, source, adjustment, method):
     checked_at = now()
-    source = 'Massive 日线（拆股调整）' + (' · 延迟' if delayed else '')
     bars = []
     for row in daily:
         o, h, l, c, v = (row[key] for key in ('open', 'high', 'low', 'close', 'vol'))
@@ -1713,16 +2041,33 @@ def load_massive_stock(meta):
             continue
         bars.append({**row, 'observed_at': checked_at, 'bar_source': source, 'netFlow': None})
     if not bars:
-        raise ValueError('Massive 未返回可核验的美股 OHLCV 日线')
+        raise ValueError(f'{provider} 未返回可核验的 OHLCV 日线')
     last = bars[-1]
-    return {'source': source, 'provider_url': url, 'history_provider': 'Massive', 'as_of': last['date'],
+    return {'source': source, 'provider_url': url, 'history_provider': provider, 'as_of': last['date'],
             'closed_as_of': max((b['date'] for b in bars if b['completed']), default=None),
-            'adjustment': 'provider', 'completed': last['completed'], 'bars': bars, 'volume_unit': '股/份',
-            'market': 'US', 'currency': 'USD', 'timezone': timezone, 'fetched_at': checked_at,
+            'adjustment': adjustment, 'completed': last['completed'], 'bars': bars, 'volume_unit': '股/份',
+            'market': meta['market'], 'currency': meta['currency'], 'timezone': timezone, 'fetched_at': checked_at,
             'history_checked_at': checked_at, 'fundamentals': None,
             'latest_quote': {'price': last['close'], 'code': meta['code'], 'name': meta['name'],
                              'timestamp': last['date'], 'date': last['date'], 'source': source},
-            'international_method': 'Massive 美元日线按拆股调整，非总回报。纽约当地当日的日线暂不进入确认回测。'}
+            'international_method': method}
+
+
+def load_futu_stock(meta):
+    market, symbol = meta['market'], meta['symbol']
+    timezone = 'Asia/Hong_Kong' if market == 'HK' else 'America/New_York'
+    ticker = meta['provider_symbol'] if meta.get('search_source') == '富途' else symbol.replace('-', '.')
+    daily, url = futu_daily(f'{market}.{ticker}', timezone)
+    return daily_stock_record(meta, daily, url, timezone, '富途', '富途日线（前复权）', 'qfq',
+                              '富途本币前复权日线，交易所当地当日的日线暂不进入确认回测。')
+
+
+def load_massive_stock(meta):
+    ticker = meta['symbol'].replace('-', '.')
+    daily, url, timezone, delayed = massive_daily(ticker)
+    source = 'Massive 日线（拆股调整）' + (' · 延迟' if delayed else '')
+    return daily_stock_record(meta, daily, url, timezone, 'Massive', source, 'provider',
+                              'Massive 美元日线按拆股调整，非总回报。纽约当地当日的日线暂不进入确认回测。')
 
 
 def load_watch_record(meta, previous=None, quotes=None):
@@ -1879,6 +2224,7 @@ class DataStore:
         self.data_revision = 0
         self.state = {'busy': False, 'done': 0, 'total': len(ASSETS), 'stage': 'idle', 'errors': {}, 'last_refresh': None,
                       'price_result': None, 'quote_sources': {}, 'successful_quote_sources': [],
+                      'quote_attempts': [],
                       'cache_path': str(self.cache), 'cache_warning': None, 'cache_persisted': False}
         self.snapshot = {'data_kind': 'local', 'instruments': {}, 'as_of': None}
         # A previous run may have switched directories. Resume its newest valid cache.
@@ -2023,7 +2369,8 @@ class DataStore:
             self.commit_snapshot(snapshot)
             with self.lock:
                 if self.job_versions.get(code) == version:
-                    self.asset_jobs[code] = {'status': 'ready', 'stage': '完成', 'finished_at': now(), 'research_gaps': record.get('research_errors', {})}
+                    self.asset_jobs[code] = {'status': 'ready', 'stage': '完成', 'finished_at': now(),
+                                             'research_gaps': record.get('research_errors', {})}
         except Exception as exc:
             with self.lock:
                 if self.job_versions.get(code) == version:
@@ -2142,7 +2489,7 @@ class DataStore:
                 return False
             self.state.update(busy=True, done=0, total=sum(bool(m.get('watch') or m.get('benchmark')) for m in self.catalog.values()),
                               errors={}, quote_sources={}, successful_quote_sources=[], price_result=None,
-                              stage='准备刷新', started_at=now())
+                              quote_attempts=[], stage='准备刷新', started_at=now())
         try:
             threading.Thread(target=self.refresh, daemon=True).start()
         except RuntimeError:
@@ -2155,9 +2502,19 @@ class DataStore:
     def refresh(self):
         instruments, errors, quote_only, quote_sources = {}, {}, {}, {}
         successful_sources = set()
+        attempts = []
         prices_published = False
+
+        def record_attempt(entry):
+            with self.lock:
+                attempts.append(entry)
+
+        def read_quotes(stage, target, load, *args, **kwargs):
+            return traced_quote_call(record_attempt, stage, target, load, *args, **kwargs)
+
         try:
             with self.lock:
+                self.state['quote_attempts'] = attempts
                 previous = json.loads(json.dumps(self.snapshot))
                 self.state['stage'] = '复核前一交易日收盘K线'
             active = self.active_metadata()
@@ -2170,15 +2527,19 @@ class DataStore:
             } for m in cn_active}
             quote_sources['初始报价'] = {}
             try:
-                quotes = load_cn_quotes(quote_symbols, issues=quote_sources['初始报价'], minimum=quote_minimum)
+                quotes = read_quotes('初始报价', 'A 股', load_cn_quotes, quote_symbols,
+                                     issues=quote_sources['初始报价'], minimum=quote_minimum)
             except OSError as exc:
                 errors['A股初始报价'] = str(exc)
                 quotes = {}
             with self.lock:
                 self.state.update(errors=dict(errors), quote_sources={'初始报价': dict(quote_sources['初始报价'])})
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(load_asset, a, quotes): a[0] for a in cn_assets} if quotes else {}
-                futures.update({pool.submit(load_international_asset, m, previous.get('instruments', {}).get(m['code'])): m['code'] for m in active if m['market'] != 'CN'})
+                futures = {pool.submit(read_quotes, 'A 股日线', a[0], load_asset, a, quotes): a[0]
+                           for a in cn_assets} if quotes else {}
+                futures.update({pool.submit(read_quotes, '自选日线', m['code'], load_international_asset, m,
+                                            previous.get('instruments', {}).get(m['code'])): m['code']
+                                for m in active if m['market'] != 'CN'})
                 for future in concurrent.futures.as_completed(futures):
                     code = futures[future]
                     try:
@@ -2208,8 +2569,9 @@ class DataStore:
             if quotes:
                 quote_sources['二次报价'] = {}
                 try:
-                    fresh_quotes = load_cn_quotes(quote_symbols, issues=quote_sources['二次报价'],
-                                                  minimum={**quote_minimum, **quotes}, require_bar=True)
+                    fresh_quotes = read_quotes('二次报价', 'A 股', load_cn_quotes, quote_symbols,
+                                               issues=quote_sources['二次报价'],
+                                               minimum={**quote_minimum, **quotes}, require_bar=True)
                 except OSError as exc:
                     live_error = str(exc)
                     errors['A股二次报价'] = live_error
@@ -2333,7 +2695,8 @@ class DataStore:
                         instruments[meta['code']].setdefault('research_errors', {})['financials'] = str(exc)[:180]
             has_external_update = False
             try:
-                external = merge_external(previous.get('external', []), load_external())
+                prior_external = previous.get('external', [])
+                external = merge_external(prior_external, read_quotes('外围日线', '', load_external, prior_external))
                 fresh_external = [r for r in external if r.get('price') is not None and not r.get('error') and not r.get('retained')]
                 has_external_update = bool(fresh_external)
                 successful_sources.update(r['provider'] for r in fresh_external if r.get('provider'))
@@ -2351,7 +2714,7 @@ class DataStore:
             sectors = {s['code']: s for s in previous.get('sectors', [])}
             for a in SECTOR_ASSETS if fresh_quotes else []:
                 try:
-                    _, sector = load_asset(a, fresh_quotes)
+                    _, sector = read_quotes('板块日线', a[0], load_asset, a, fresh_quotes)
                     patch_quote(sector, fresh_quotes[SYMBOLS[a[0]]])
                     if sector['as_of'] >= sectors.get(a[0], {}).get('as_of', ''):
                         sectors[a[0]] = {'code': a[0], 'name': a[1], **sector}
@@ -2376,9 +2739,10 @@ class DataStore:
                     errors['刷新任务'] = '各行情源未返回可发布的价格'
                 price_errors = any(key != 'geopolitics' for key in errors)
                 result = ('partial' if price_errors else 'ok') if prices_published else 'failed'
+                finished_at = now()
                 self.state.update(busy=False, stage='完成', errors=errors, quote_sources=quote_sources,
                                   successful_quote_sources=sorted(successful_sources) if prices_published else [],
-                                  price_result=result, last_refresh=now())
+                                  price_result=result, last_refresh=finished_at)
 
     def commit_snapshot(self, snapshot):
         with self.commit_lock:
@@ -2447,6 +2811,21 @@ class DataStore:
                 self.state.update(cache_path=None, cache_warning=warning, cache_persisted=False)
 
 
+class LocalHTTPServer(ThreadingHTTPServer):
+    def __init__(self, address, handler):
+        host, _ = address
+        if ':' in host:
+            self.address_family = socket.AF_INET6
+        self.listen_host = host
+        super().__init__(address, handler)
+
+    def local_url(self):
+        host = {'': '127.0.0.1', '0.0.0.0': '127.0.0.1', '::': '::1'}.get(self.listen_host, self.listen_host)
+        if ':' in host:
+            host = f'[{host}]'
+        return f'http://{host}:{self.server_port}/'
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'RiskLensLocal/0.9.0'
 
@@ -2478,22 +2857,15 @@ class Handler(BaseHTTPRequestHandler):
                 return False
         except ValueError:
             return False
-        # Some reverse proxies rewrite Host after the browser has verified same origin.
-        return site == 'same-origin' or url.netloc.lower() == self.headers.get('Host', '').lower()
+        # Reverse proxies can forward the public host when they rewrite Host.
+        return site == 'same-origin' or url.netloc.lower() in (
+            self.headers.get('Host', '').lower(), self.headers.get('X-Forwarded-Host', '').strip().lower())
 
-    def is_private_settings_page(self):
-        host = self.headers.get('Host', '').lower()
-        try:
-            address = urllib.parse.urlsplit('//' + host)
-            if (address.netloc != host or address.username is not None or not address.hostname
-                    or (address.port or 80) != self.server.server_port):
-                return False
-            host_is_loopback = address.hostname == 'localhost' or ipaddress.ip_address(address.hostname).is_loopback
-            return (host_is_loopback and ipaddress.ip_address(self.client_address[0]).is_loopback
-                    and ipaddress.ip_address(self.server.server_address[0]).is_loopback
-                    and self.headers.get('Origin') in (None, 'http://' + host))
-        except ValueError:
-            return False
+    def market_key_statuses(self):
+        statuses = {'ifind': {'available': True, **ifind_connection_status()}}
+        statuses.update({provider: {'available': True, **market_key_status(provider)}
+                         for provider in MARKET_KEY_SETTINGS})
+        return statuses
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
@@ -2522,10 +2894,8 @@ class Handler(BaseHTTPRequestHandler):
                           'as_of': self.server.store.snapshot.get('as_of'),
                           'closed_as_of': self.server.store.snapshot.get('closed_as_of'),
                           'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server', 'data_revision': self.server.store.data_revision, 'watchlist_revision': self.server.store.watchlist_revision, 'asset_jobs': dict(self.server.store.asset_jobs)}
-            available = self.is_private_settings_page()
-            result['market_keys'] = {'ifind': {'available': available, **(ifind_connection_status() if available else {})}}
-            for provider in MARKET_KEY_SETTINGS:
-                result['market_keys'][provider] = {'available': available, **(market_key_status(provider) if available else {})}
+                result['quote_attempts'] = list(result.get('quote_attempts', []))
+            result['market_keys'] = self.market_key_statuses()
             result['ifind'] = result['market_keys']['ifind']
             return self.send(result)
         if path == '/api/snapshot':
@@ -2556,8 +2926,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({'error': 'Not found'}, status=404)
         if not self.is_page_request():
             return self.send({'error': '仅允许当前页面发起操作'}, status=403)
-        if key_provider and not self.is_private_settings_page():
-            return self.send({'error': '请在运行服务的电脑上通过本地地址打开工作台，再配置行情密钥'}, status=403)
         if not secrets.compare_digest(self.headers.get('X-RiskLens-Token', '').encode('utf-8'), TOKEN.encode('ascii')):
             return self.send({'error': '页面会话已失效，请刷新页面后重试', 'code': 'stale_session'}, status=403)
         if self.path == '/api/refresh':
@@ -2568,13 +2936,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({'started': started}, status=202 if started else 200)
         try:
             length = int(self.headers.get('Content-Length', 0))
-            if not 0 < length <= 4096:
+            if not 0 < length <= (16384 if key_provider == 'futu' else 4096):
                 raise ValueError('请求体长度无效')
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError('需要JSON对象')
             if key_provider:
-                return self.send(test_ifind_connection(payload) if key_provider == 'ifind' else test_market_key(key_provider, payload))
+                result = test_ifind_connection(payload) if key_provider == 'ifind' else test_market_key(key_provider, payload)
+                result['market_keys'] = self.market_key_statuses()
+                return self.send(result)
             store = self.server.store
             if self.path == '/api/screening/start':
                 return self.send({'id': store.start_screening(payload)}, status=202)
@@ -2611,11 +2981,11 @@ def main():
     args = parser.parse_args()
     PROXY_MODE = args.proxy_mode
     store = DataStore(args.cache)
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = LocalHTTPServer((args.host, args.port), Handler)
     server.store = store
     if not args.no_refresh:
         store.start()
-    url = 'http://' + args.host + ':' + str(args.port) + '/'
+    url = server.local_url()
     print('观澜本地研究环境：' + url, flush=True)
     print('先复核前日收盘，再刷新当天K线；财务、资金、公告及ETF证据按来源更新。Ctrl+C停止。', flush=True)
     if not args.no_browser:

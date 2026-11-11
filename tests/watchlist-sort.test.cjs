@@ -35,3 +35,25 @@ test('all six watch fund columns sort numeric amounts, retain zero and keep miss
  assert.deepEqual(codes(sort(rows,{key,direction:'asc'},valueOf)),['out','zero','in','missing']);assert.deepEqual(codes(sort(rows,{key,direction:'desc'},valueOf)),['in','zero','out','missing']);
  }
 });
+test('one category row includes one All tab and counts ETFs by their market',()=>{
+ const stocks=[
+  {code:'600519',type:'stock'},{code:'US.AAPL',market:'US',type:'stock'},
+  {code:'US.QQQ',type:'etf'},{code:'HK.00700',market:'HK',type:'stock'},{code:'HK.02800',market:'HK',type:'etf'}
+ ];
+ Object.assign(context,{
+  WATCH_CODES:stocks.map(stock=>stock.code),byCode:code=>stocks.find(stock=>stock.code===code),
+  hasLocalServer:true,mode:'local',localStatus:null,render(){},title:()=>'',button:()=>'',icon:()=>'',
+  filteredStocks:context.window.filteredStocks,watchTable:()=>'',state:{filter:'all',query:''}
+ });
+ const listed=()=>Array.from(vm.runInContext('managedFilteredStocks()',context),asset=>asset.code);
+ const html=vm.runInContext('managedWatchlist()',context);
+ assert.equal((html.match(/class="filter-tabs/g)||[]).length,1);
+ assert.equal((html.match(/>全部 5<\/button>/g)||[]).length,1);
+ assert.match(html,/>港股 2<\/button>.*>美股 2<\/button>/s);
+ vm.runInContext("state.filter='US'",context);
+ assert.deepEqual(listed(),['US.AAPL','US.QQQ']);
+ vm.runInContext("state.filter='etf'",context);
+ assert.deepEqual(listed(),['US.QQQ','HK.02800']);
+ vm.runInContext("state.filter='HK'",context);
+ assert.deepEqual(listed(),['HK.00700','HK.02800']);
+});

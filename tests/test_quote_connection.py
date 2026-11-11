@@ -163,10 +163,15 @@ class QuoteConnection(unittest.TestCase):
                 store = app.DataStore(path)
                 old = store.snapshot
                 store.refresh()
+                first_run = store.state['quote_attempts']
+                store.refresh()
         self.assertEqual(store.state['price_result'], 'failed')
         self.assertIs(store.snapshot, old)
         self.assertEqual(list(store.state['quote_sources']['初始报价']), ['腾讯报价', '新浪报价', '同花顺 iFinD 报价'])
         self.assertIn('未配置', store.state['quote_sources']['初始报价']['同花顺 iFinD 报价'])
+        self.assertEqual([row['provider'] for row in first_run], ['腾讯报价', '新浪报价', '同花顺 iFinD 报价'])
+        self.assertIsNot(store.state['quote_attempts'], first_run)
+        self.assertNotIn('quote_attempt_history', store.state)
 
     def test_a_share_outage_keeps_old_records_and_allows_external_prices_to_update(self):
         with tempfile.TemporaryDirectory() as directory:

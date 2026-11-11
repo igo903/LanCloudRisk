@@ -26,8 +26,37 @@ async function addWatchCandidate(code){const a=watchSearch.results.find(x=>x.cod
 async function refreshWatchAsset(code){if(!hasLocalServer||mode!=='local')return toast('请在本地行情模式刷新');try{await watchRequest('/api/watchlist/refresh',{code});await connectLocal();toast('正在重新获取该标的数据')}catch(e){toast('刷新失败：'+e.message)}}
 function requestRemoveWatch(code){const a=byCode(code);if(!a?.watch)return;const revision=watchRevision(),dialog=$('#dialog');dialog.dataset.kind='watch-remove';dialog.setAttribute('aria-label','删除自选股');dialog.innerHTML=`<div class="dialog-head"><h2>删除这只自选股？</h2><button class="icon-button" aria-label="关闭删除自选" onclick="document.getElementById('dialog').close()">${icon('close')}</button></div><div class="dialog-body watch-dialog-body"><div class="deletion-detail"><strong>${esc(a.name)}</strong><p>${WATCH_MARKET_NAMES[a.market||'CN']} · ${esc(a.symbol||a.code)}</p></div><p class="small muted">仅移出自选，已保存的研究记录保留。${a.benchmark?'该ETF仍在六ETF观察池中，继续更新市场数据。':'之后可通过搜索重新添加。'}</p><div class="dialog-actions"><button class="btn" onclick="document.getElementById('dialog').close()">取消</button><button id="confirm-watch-remove" class="btn danger-solid" onclick="confirmRemoveWatch('${code}',${revision})">删除自选</button></div></div>`;dialog.showModal()}
 async function confirmRemoveWatch(code,revision){const control=$('#confirm-watch-remove');if(control)control.disabled=true;try{await watchRequest('/api/watchlist/remove',{code,expected_revision:revision});$('#dialog').close();await connectLocal();toast('已从自选移除，可通过搜索重新添加')}catch(e){if(control)control.disabled=false;toast('删除失败：'+e.message)}}
-function managedFilteredStocks(){return WATCH_CODES.map(byCode).filter(Boolean).filter(a=>(state.filter==='all'||a.type===state.filter)&&(!state.watchMarket||state.watchMarket==='ALL'||(a.market||'CN')===state.watchMarket)&&(!state.query||[a.name,a.code,a.symbol,a.industry,a.verified_name].filter(Boolean).some(s=>s.toLowerCase().includes(state.query.toLowerCase()))))}
-function managedWatchlist(){const stocks=WATCH_CODES.map(byCode).filter(Boolean),canManage=hasLocalServer&&mode==='local';return title('我的自选','A股、港股、美股分别标注数据时间与币种，新增后自动联动研究和回测。',`<button class="btn primary" onclick="openWatchSearch()" ${canManage?'':'disabled'}>${icon('plus')}添加自选股</button>`+button('比较A股因子',"go('factors')",false,'settings'))+`<div class="toolbar"><div class="filter-tabs">${[['all','全部 '+stocks.length],['stock','股票 '+stocks.filter(a=>a.type==='stock').length],['etf','ETF '+stocks.filter(a=>a.type==='etf').length]].map(([id,label])=>`<button class="filter-chip ${state.filter===id?'active':''}" onclick="state.filter='${id}';render()">${label}</button>`).join('')}</div><div class="watch-filter-tools"><select aria-label="筛选自选市场" onchange="state.watchMarket=this.value;render()">${[['ALL','全部市场'],['CN','A股'],['HK','港股'],['US','美股']].map(([id,label])=>`<option value="${id}" ${(state.watchMarket||'ALL')===id?'selected':''}>${label}</option>`).join('')}</select><input placeholder="名称 / 代码 / 行业" aria-label="筛选自选" value="${esc(state.query)}" oninput="state.query=this.value;document.getElementById('watch-rows').innerHTML=watchTable(filteredStocks())"></div></div>${!canManage?notice('运行本地单文件服务并切换真实行情模式后，可搜索、添加和删除自选股。'):''}${localStatus?.cache_warning?notice('自选持久化状态：'+esc(localStatus.cache_warning),'warn'):''}<section class="panel"><div id="watch-rows">${watchTable(filteredStocks())}</div></section><p class="watch-market-note">5 / 20 / 60 / 220日均为各标的有效日频间隔，按交易币种计算，不是人民币组合收益。港美股不套A股六ETF过滤；海外研究成交单位为1股，港股真实每手数量、碎股撮合与完整税费尚未建模。年度财务与A股累计季度披露分开标注。</p>`}
+function watchMarketOf(asset){
+ if(asset.market)return asset.market;
+ return /^(US|HK)\./.exec(asset.code)?.[1]||'CN';
+}
+function watchMatchesCategory(asset,category){
+ return category==='all'||asset.type===category||watchMarketOf(asset)===category;
+}
+function managedFilteredStocks(){
+ const category=state.filter||'all';
+ const query=state.query?.toLowerCase();
+ return WATCH_CODES.map(byCode).filter(a=>a&&watchMatchesCategory(a,category)&&(!query||
+  [a.name,a.code,a.symbol,a.industry,a.verified_name].filter(Boolean).some(value=>value.toLowerCase().includes(query))));
+}
+function managedWatchlist(){
+ const stocks=WATCH_CODES.map(byCode).filter(Boolean),category=state.filter||'all';
+ const canManage=hasLocalServer&&mode==='local';
+ const categories=[['all','全部'],...Object.entries(WATCH_MARKET_NAMES),['stock','股票'],['etf','ETF']];
+ const tabs=categories.map(([id,label])=>{
+  const count=stocks.filter(asset=>watchMatchesCategory(asset,id)).length;
+  return `<button type="button" class="filter-chip ${category===id?'active':''}" aria-pressed="${category===id}" onclick="state.filter='${id}';render()">${label} ${count}</button>`;
+ }).join('');
+ return title('我的自选','按上市市场查看股票与 ETF，新增后自动联动研究和回测。',
+  `<button class="btn primary" onclick="openWatchSearch()" ${canManage?'':'disabled'}>${icon('plus')}添加自选股</button>`+button('比较A股因子',"go('factors')",false,'settings'))+
+  `<div class="toolbar"><div class="filter-tabs watch-category-tabs" role="group" aria-label="自选分类">${tabs}</div>
+   <div class="watch-filter-tools"><input placeholder="名称 / 代码 / 行业" aria-label="筛选自选" value="${esc(state.query)}" oninput="state.query=this.value;document.getElementById('watch-rows').innerHTML=watchTable(filteredStocks())"></div>
+  </div>
+  ${!canManage?notice('运行本地单文件服务并切换真实行情模式后，可搜索、添加和删除自选股。'):''}
+  ${localStatus?.cache_warning?notice('自选持久化状态：'+esc(localStatus.cache_warning),'warn'):''}
+  <section class="panel"><div id="watch-rows">${watchTable(filteredStocks())}</div></section>
+  <p class="watch-market-note">5 / 20 / 60 / 220日均为各标的有效日频间隔，按交易币种计算，不是人民币组合收益。港美股不套A股六ETF过滤；海外研究成交单位为1股，港股真实每手数量、碎股撮合与完整税费尚未建模。年度财务与A股累计季度披露分开标注。</p>`;
+}
 window.watchlist=managedWatchlist;window.filteredStocks=managedFilteredStocks;
 if(uploaded?.catalog)syncWatchCatalog(uploaded.catalog);
 document.getElementById('dialog').addEventListener('close',()=>{if(document.getElementById('dialog').dataset.kind==='watch-search'){watchSearch.controller?.abort();clearTimeout(watchSearch.timer);watchSearch.sequence++}});

@@ -53,9 +53,9 @@ class WatchlistTests(unittest.TestCase):
         original_daily = app.massive_daily
         with patch.object(app, 'massive_daily', side_effect=lambda ticker: original_daily(ticker, current=current)), \
              patch.object(app, 'massive_json', return_value=payload) as massive, \
-             patch.object(app, 'read_yahoo_chart') as yahoo:
+             patch.object(app, 'read_yahoo_chart', side_effect=ValueError('Yahoo HTTP 403')) as yahoo:
             code, record = app.load_international_asset(meta)
-        yahoo.assert_not_called()
+        yahoo.assert_called_once()
         self.assertIn('/ticker/BRK.B/', massive.call_args.args[0])
         self.assertEqual((code, record['history_provider'], record['closed_as_of']), ('US.BRK-B', 'Massive', '2026-11-09'))
         self.assertFalse(record['bars'][-1]['completed'])
