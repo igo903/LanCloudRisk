@@ -15,8 +15,8 @@ const RiskEngine=(()=>{
  function beta(b,benchmark){const common=new Map(benchmark.map(x=>[x.date,x.close]));const weeks=[];let prevWeek='';for(const x of b){const d=new Date(x.date+'T00:00:00Z');const week=Math.floor((d.getTime()/864e5+3)/7);if(common.has(x.date)){if(week===prevWeek)weeks[weeks.length-1]=[x.close,common.get(x.date)];else weeks.push([x.close,common.get(x.date)]);prevWeek=week}}if(weeks.length<105)return null;const seg=weeks.slice(-105),a=[],m=[];for(let i=1;i<seg.length;i++){a.push(seg[i][0]/seg[i-1][0]-1);m.push(seg[i][1]/seg[i-1][1]-1)}const ma=mean(a),mm=mean(m),den=m.reduce((s,v)=>s+(v-mm)**2,0);return den?a.reduce((s,v,i)=>s+(v-ma)*(m[i]-mm),0)/den:null}
  function indicator(b,n=3,n1=3){const c=b.map(x=>x.close),e=ema(ema(ema(c,n),n),n),short=e.map((v,i)=>2*v-(i?e[i-1]:v)),mid=ma(short,n1),ma20=ma(c,20),ma60=ma(c,60);return b.map((x,i)=>{const seg=c.slice(Math.max(0,i-19),i+1),vols=b.slice(Math.max(0,i-5),i).map(v=>v.vol),rng=x.high-x.low;return {...x,short:short[i],mid:mid[i],ma20:ma20[i],ma60:ma60[i],width:ma20[i]?4*std(seg)/ma20[i]:0,vr:vols.length&&mean(vols)>0?x.vol/mean(vols):null,pos:rng>0?(x.close-x.low)/rng:.5}})}
  function signals(b,{enhanced=false}={}){if(b.length<61)return [];const fast=indicator(b,3,3),slow=indicator(b,5,5),out=[];for(let i=60;i<b.length;i++){const x=fast[i],prev=fast[i-1],s=slow[i],ps=slow[i-1],cross=x.short>x.mid&&prev.short<=prev.mid,death=x.short<x.mid&&prev.short>=prev.mid,death5=s.short<s.mid&&ps.short>=ps.mid;const flow=valid(x.netFlow)?x.netFlow/1e8:null,mf=flow===null?null:Math.max(-2,Math.min(2,flow/5));const pc=x.close/b[i-5].close-1,vc=x.vol/b[i-5].vol-1,vpd=pc>0&&vc<0?-1:pc<0&&vc<0?1:pc>0&&vc>0?.5:0,avg=mean(fast.slice(i-20,i).map(v=>v.width)),exp=avg?x.width/avg:1,score=mf===null?null:.4*mf+.3*vpd+.3*(exp-1)*2;let type=null,grade=null,reason='',filtered=false;
- if(cross){type='buy';grade=x.pos<.5?'C':x.pos>=.8&&x.vr>=1.2&&x.close>x.ma60?'A':'B';reason='N3 SHORTL上穿MIDL';if(enhanced&&score!==null&&grade!=='C'&&score<-.5){filtered=true;reason+='；三因子低于−0.5，过滤'}}
- else if(enhanced&&flow!==null&&flow>2&&x.short<x.mid&&x.pos>=.8&&x.vr>=1&&Math.abs(x.short-x.mid)<6){type='buy';grade='B';reason='资金增强候选（绝对阈值沿用skill，未校准）';if(score<-.5)filtered=true}
+ if(cross){type='buy';grade=x.pos<.5?'C':x.pos>=.8&&x.vr>=1.2&&x.close>x.ma60?'A':'B';reason='N3 SHORTL上穿MIDL';if(enhanced&&score!==null&&grade==='A'&&score<-.5){filtered=true;reason+='；三因子低于−0.5，过滤'}}
+ else if(enhanced&&flow!==null&&flow>2&&x.short<x.mid&&x.pos>=.8&&x.vr>=1&&Math.abs(x.short-x.mid)<6){type='buy';grade='B';reason='资金增强候选（绝对阈值沿用skill，未校准）'}
  if(!type&&((enhanced&&death&&flow!==null&&flow< -3)||death5)){type='sell';grade=x.pos<=.4||x.vr>=1.5||(enhanced&&death&&flow!==null&&flow< -3)?'strong':'normal';if(enhanced&&vpd<0&&mf!==null&&mf<0)grade='strong';reason=death5?'N5 SHORTL下穿MIDL':'N3死叉与资金流出确认'}
  if(type)out.push({i,date:x.date,type,grade,reason,filtered,price:x.close,vr:x.vr,pos:x.pos,score,mf,vpd,exp,provisional:x.completed===false,observed_at:x.observed_at||null,enhancedApplied:enhanced&&mf!==null})}return out}
  function factorRows(data,weights,selectedAssets=null){const assets=selectedAssets===null?CATALOG.filter(x=>x.type==='stock'&&x.watch&&(x.market||'CN')==='CN'):selectedAssets.filter(x=>x.type==='stock'),all=assets.map(a=>{const f=data.instruments?.[a.code]?.fundamentals||{},m=metrics(series(data,a.code));return {asset:a,raw:{...f,invPb:valid(f.pb)&&f.pb>0?1/f.pb:null,momentum12:m?.momentum12??null,vol252:m?.vol252??null,downside:m?.downside??null,beta104:beta(series(data,a.code),(a.market||'CN')==='CN'?series(data,'510300'):(data.external||[]).find(r=>r.symbol===(a.market==='US'?'usQQQ':'hkHSTECH'))?.history||[])},scores:{},missing:[]}});const pct=(vals,v,d)=>{if(vals.length<3||!valid(v))return null;const sorted=[...vals].sort((a,b)=>a-b),q=p=>sorted[Math.floor((sorted.length-1)*p)],lo=q(.025),hi=q(.975),x=Math.max(lo,Math.min(hi,v)),clipped=vals.map(v=>Math.max(lo,Math.min(hi,v))),less=clipped.filter(v=>d*v<d*x).length,equal=clipped.filter(v=>v===x).length;return (less+(equal+1)/2)/vals.length*100};
@@ -41,14 +41,106 @@ const RiskEngine=(()=>{
   if(!p.wyckoff)return {raw,signals:baseline,wyckoff:null};
   const result=WyckoffEngine.integrate(raw,baseline);return {raw,signals:result.signals,wyckoff:{...result,rows:result.rows.filter(x=>x.date>=p.start&&x.date<=p.end)}};
  }
- function backtest(data,code,p){const plan=signalPlan(data,code,p),{raw,signals:all,wyckoff}=plan,bars=raw.filter(b=>b.date>=p.start&&b.date<=p.end);if(!bars.length)return {error:'所选区间没有数据',signals:[],wyckoff};const sigByDate=new Map(all.map(s=>[s.date,s]));let cash=p.capital,units=0,entry=0,peak=cash,dd=0,heldAge=0;const net=[],hold=[],orders=[],trades=[];const benchMaps=BENCH_CODES.map(c=>new Map(series(data,c).map((b,i,arr)=>[b.date,i>=9?{close:b.close,ma10:mean(arr.slice(i-9,i+1).map(x=>x.close))}:null])));const fee=p.fee/10000,slip=p.slip/10000;
- for(let i=0;i<bars.length;i++){const b=bars[i],idx=raw.findIndex(v=>v.date===b.date),prev=idx>0?raw[idx-1]:null,s=prev&&prev.date>=p.start?sigByDate.get(prev.date):null;heldAge++;
- if(s){let gate=false,gateReason='';if(p.marketGate&&(CATALOG.find(a=>a.code===code)?.market||'CN')==='CN'&&s.type==='buy'){const market=benchMaps.map(m=>m.get(s.date));if(market.some(x=>!x)){gate=true;gateReason='六ETF历史不足，暂停该笔新增模拟'}else if(market.filter(x=>x.close<x.ma10).length>=4){gate=true;gateReason='六ETF中至少4只低于MA10，过滤买入'}}let skip=s.filtered||s.grade==='C'||gate||s.type==='buy'&&units>0||s.type==='sell'&&(!units||heldAge<1);let reason=s.filtered?(s.filterReason||'三因子过滤'):s.grade==='C'?'C级默认跳过':gate?gateReason:s.type==='buy'&&units>0?'已持仓，不重复加仓':s.type==='sell'&&!units?'空仓，无可卖模拟单位':'';let price=null;if(!skip){if(b.vol<=0||b.high===b.low){skip=true;reason='无量或单一价格，保守不成交'}else if(p.execution==='open')price=b.open*(s.type==='buy'?1+slip:1-slip);else{const limit=s.price*(s.type==='buy'?1-p.limit/100:1+p.limit/100);if(s.type==='buy')price=b.open<=limit?b.open*(1+slip):b.low<limit?limit:null;else price=b.open>=limit?b.open*(1-slip):b.high>limit?limit:null;if(price!==null)price=s.type==='buy'?Math.min(price,limit):Math.max(price,limit);if(price===null){skip=true;reason='次日未穿越限价，保留未成交'}}}
- let qty=0,pnl=null;if(!skip&&price!==null){if(s.type==='buy'){qty=Math.floor(cash*p.position/100/(price*(1+fee))/p.lot)*p.lot;if(qty<=0){skip=true;reason='现金不足研究交易单位'}else{const spent=qty*price*(1+fee);cash-=spent;units=qty;entry=spent;heldAge=0}}else{qty=units;const received=qty*price*(1-fee);cash+=received;pnl=(received/entry-1)*100;units=0}if(!skip)trades.push({signal:s.date,date:b.date,type:s.type,grade:s.grade,price,qty,cost:qty*price*fee,pnl})}orders.push({signal:s.date,date:b.date,type:s.type,grade:s.grade,status:skip?'未成交/跳过':'模拟成交',reason:reason||'研究成交假设',price:skip?null:price,qty,cost:skip?null:qty*price*fee})}
- const equity=cash+units*b.close;peak=Math.max(peak,equity);dd=Math.max(dd,(peak-equity)/peak*100);net.push((equity/p.capital-1)*100);hold.push((b.close/bars[0].open-1)*100)}const completed=trades.filter(t=>t.pnl!==null),summary=summarizeOrders(orders),last=bars.at(-1);
+ function backtest(data,code,p){
+ const {raw,signals:all,wyckoff}=signalPlan(data,code,p);
+ const inRange=x=>x.date>=p.start&&x.date<=p.end;
+ const bars=raw.filter(inRange),confirmedByDate=new Set(raw.map(b=>b.date));
+ const chartBars=series(data,code,{includeLive:true});
+ const confirmedSignals=all.filter(inRange);
+ const provisionalSignals=chartBars.some(b=>inRange(b)&&!confirmedByDate.has(b.date))
+  ?signals(chartBars.filter(b=>b.date<=p.end).map(b=>({...b,completed:confirmedByDate.has(b.date)})),{enhanced:p.enhanced}).filter(s=>s.provisional&&inRange(s)):[];
+ const marketByCode=new Map(CATALOG.map(a=>[a.code,a.market||'CN']));
+ const market=marketByCode.get(code)||'CN';
+ // Use observed dates in the same market, so a missing or provisional bar never rolls an order forward.
+ const ownDates=new Set(chartBars.map(b=>b.date)),sessionDates=new Set(ownDates);
+ for(const [other,record] of Object.entries(data.instruments||{})){
+  if(other!==code&&marketByCode.get(other)!==market)continue;
+  if(other!==code)for(const b of series(data,other,{includeLive:true}))sessionDates.add(b.date);
+  const quote=record?.latest_quote;
+  if(validDate(quote?.date)&&valid(quote.open)&&quote.open>0)sessionDates.add(quote.date);
+ }
+ const sessions=[...sessionDates].sort(),nextSession=new Map(sessions.map((date,i)=>[date,sessions[i+1]??null]));
+ const benchMaps=p.marketGate&&market==='CN'
+  ?BENCH_CODES.map(c=>new Map(series(data,c).map((b,i,arr)=>[b.date,i>=9?{close:b.close,ma10:mean(arr.slice(i-9,i+1).map(x=>x.close))}:null]))):null;
+ const orders=[],scheduled=new Map();
+ const shownSignals=[...confirmedSignals,...provisionalSignals].sort((a,b)=>a.date.localeCompare(b.date));
+ for(const s of shownSignals){
+  const date=s.provisional?null:nextSession.get(s.date)??null;
+  const order={signal:s.date,date,type:s.type,grade:s.grade,status:'未成交/跳过',reason:'',price:null,qty:0,cost:null,positionPct:null};
+  orders.push(order);
+  if(s.provisional){order.status='待信号确认';order.reason='信号日K尚未确认收盘，确认后才安排次日模拟';continue;}
+  if(s.filtered)order.reason=s.filterReason||'三因子过滤';
+  else if(s.grade==='C')order.reason='C级默认跳过';
+  else if(s.type==='buy'&&benchMaps){
+   const benchmarks=benchMaps.map(m=>m.get(s.date));
+   if(benchmarks.some(x=>!x))order.reason='六ETF历史不足，暂停该笔新增模拟';
+   else if(benchmarks.filter(x=>x.close<x.ma10).length>=4)order.reason='六ETF中至少4只低于MA10，过滤买入';
+  }
+  if(order.reason)continue;
+  if(date&&date>p.end){order.status='区间外';order.reason='下一交易日超出当前回测结束日';}
+  else if(!date||!confirmedByDate.has(date)){
+   const historicalGap=date&&sessions.at(-1)>date;
+   order.status=historicalGap?'未成交/跳过':'待次日日线';
+   order.reason=!date?'等待下一交易日的收盘日线'
+    :ownDates.has(date)?'下一交易日日线尚未确认收盘':'当前快照缺少下一交易日的本标的日线';
+   if(historicalGap)order.reason+='，订单未顺延';
+  }else scheduled.set(date,{s,order});
+ }
+ if(!bars.length)return {error:'所选区间没有已确认收盘日线',bars,signals:confirmedSignals,provisionalSignals,orders,wyckoff};
+ const fee=p.fee/10000,slip=p.slip/10000;
+ let cash=p.capital,units=0,peak=cash,dd=0;
+ const net=[],hold=[];
+ for(const b of bars){
+  const execution=scheduled.get(b.date);
+  if(execution){
+   const {s,order}=execution;
+   const buy=s.type==='buy';
+   let reason='',price=null,qty=0,cost=null,positionPct=null;
+   if(!buy&&!units)reason='空仓，无可卖模拟单位';
+   if(!reason&&buy&&cash<=0)reason='已满仓（100%），跳过买入';
+   if(!reason&&buy&&p.position===100&&units>0)reason='已按100%研究仓位建仓，跳过买入';
+   if(!reason){
+    if(b.vol<=0||b.high===b.low)reason='无量或单一价格，保守不成交';
+    else if(p.execution==='open')price=b.open*(buy?1+slip:1-slip);
+    else{
+     const limit=s.price*(buy?1-p.limit/100:1+p.limit/100);
+     if(buy)price=b.open<=limit?Math.min(b.open*(1+slip),limit):b.low<limit?limit:null;
+     else price=b.open>=limit?Math.max(b.open*(1-slip),limit):b.high>limit?limit:null;
+     if(price===null)reason='次日未穿越限价，保留未成交';
+    }
+   }
+   if(price!==null){
+    if(buy){
+     const lotCost=price*p.lot*(1+fee);
+     const budget=Math.min(cash,(cash+units*price)*(p.position/100));
+     qty=Math.floor(budget/lotCost)*p.lot;
+     if(qty<=0){
+      reason=cash<lotCost?'剩余现金不足一个研究交易单位（含费用）':'单次研究仓位不足一个交易单位（含费用）';
+      price=null;
+     }
+    }else qty=units;
+    if(price!==null){
+     const gross=qty*price;
+     cost=gross*fee;
+     if(buy){cash=Math.max(0,cash-(gross+cost));units+=qty;}
+     else {cash+=gross-cost;units=0;}
+     const value=units*price;
+     positionPct=100*value/(cash+value);
+    }
+   }
+   Object.assign(order,{status:price===null?'未成交/跳过':'模拟成交',reason:reason||'研究成交假设',price,qty,cost,positionPct});
+  }
+  const equity=cash+units*b.close;
+  peak=Math.max(peak,equity);dd=Math.max(dd,(peak-equity)/peak*100);
+  net.push((equity/p.capital-1)*100);hold.push((b.close/bars[0].open-1)*100);
+ }
+ const summary=summarizeOrders(orders),last=bars.at(-1);
+ const trades=summary.orders.filter(o=>o.status==='模拟成交').map(({signal,date,type,grade,price,qty,cost,cycleReturn})=>
+  ({signal,date,type,grade,price,qty,cost,pnl:cycleReturn}));
+ const completed=trades.filter(t=>t.pnl!==null);
  const openValue=summary.openUnits*last.close,openProfit=openValue-summary.openCost;
  const openPosition=summary.openUnits>0&&summary.openCost>0?{units:summary.openUnits,cost:summary.openCost,value:openValue,profit:openProfit,return:openProfit/summary.openCost*100,price:last.close,date:last.date,buyDate:trades.findLast(t=>t.type==='buy')?.date}:null;
- return {bars,wyckoff,signals:all.filter(s=>s.date>=p.start&&s.date<=p.end),net,hold,trades,...summary,openPosition,cash,units,capital:p.capital,ret:net.at(-1),dd,completed:completed.length,win:completed.length?completed.filter(t=>t.pnl>0).length/completed.length*100:null,lastEquity:cash+units*last.close}}
+ return {bars,wyckoff,signals:confirmedSignals,provisionalSignals,net,hold,trades,...summary,openPosition,cash,units,capital:p.capital,ret:net.at(-1),dd,completed:completed.length,win:completed.length?completed.filter(t=>t.pnl>0).length/completed.length*100:null,lastEquity:cash+units*last.close}}
  return {mean,std,valid,ema,ma,clone,demo,series,metrics,indicator,signals,factorRows,validateCatalog,validateSnapshot,summarizeOrders,signalPlan,backtest};
 })();
 if(typeof module!=='undefined')module.exports=RiskEngine;

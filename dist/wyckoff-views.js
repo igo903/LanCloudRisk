@@ -25,10 +25,13 @@ function wyckoffObservation(e){
 }
 function backtestSignalTable(r){
  const adjustments=new Map((r.wyckoff?.rows||[]).map(row=>[row.date,row]));
- const rows=r.signals.map(s=>{
+ const orders=new Map((r.orders||[]).map(order=>[order.signal,order]));
+ const rows=[...r.signals,...(r.provisionalSignals||[])].sort((a,b)=>a.date.localeCompare(b.date)).map(s=>{
   const event=adjustments.get(s.date)?.event;
+  const order=orders.get(s.date);
+  const outcome=order?`<div class="table-sub">${order.date?esc(order.date)+' · ':''}${esc(order.status)} · ${esc(order.reason)}</div>`:'';
   const reason=event?`<div class="table-sub">${esc(event.label)} · ${esc(event.date)}<br>${esc(wyckoffEventReason(event))} ${esc(wyckoffObservation(event))}</div>`:'';
-  return `<tr><td>${esc(s.date)} 收盘</td><td>${face(s)} ${s.wyckoff?WY_TRIANGLE:''}</td><td class="num">${num(s.pos)} / ${num(s.vr)}</td><td class="num">${num(s.score)}${s.origin==='wyckoff'?'（威科夫新增）':s.score===null?'（资金缺失）':''}</td><td class="wy-evidence-text">${esc(s.reason)}${reason}</td></tr>`;
+  return `<tr><td>${esc(s.date)} ${s.provisional?'盘中未确认':'收盘'}</td><td>${face(s)} ${s.wyckoff?WY_TRIANGLE:''}</td><td class="num">${num(s.pos)} / ${num(s.vr)}</td><td class="num">${num(s.score)}${s.origin==='wyckoff'?'（威科夫新增）':s.score===null?'（资金缺失）':''}</td><td class="wy-evidence-text">${esc(s.reason)}${reason}${outcome}</td></tr>`;
  }).join('');
  return `<div class="table-wrap"><table class="wy-backtest-table"><thead><tr><th>形成时间</th><th>信号</th><th>POS / 量比</th><th>三因子分</th><th>触发依据</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="empty">当前区间没有笑哭脸研究信号。</td></tr>'}</tbody></table></div>`;
 }
@@ -59,7 +62,7 @@ function wyckoffEvidencePanel(r){
  const rows=w.rows.slice().reverse().map(row=>{
   const e=row.event,order=orders.get(row.date);
   const name=row.direction==='buy'?'偏强 · 买入依据':'偏弱 · 卖出依据';
-  const status=order?esc(order.status)+' · '+esc(order.reason):row.signal?.wyckoff?'未生成次日订单（区间末日或无后续收盘）':'—';
+  const status=order?esc(order.status)+' · '+esc(order.reason):'—';
   return '<tr><td><button class="text-button" onclick="focusBacktestDate(\''+esc(row.date)+'\')" aria-label="定位威科夫信号 '+esc(row.date)+'">'+esc(row.date)+'</button></td><td>'+esc(name)+'<div class="table-sub">'+esc(e.label)+'</div></td><td>'+esc(e.date)+'<div class="table-sub">验证 '+esc(row.confirmationDate)+'</div></td><td>'+pill(WY_ACTIONS[row.action],row.action==='filtered'||row.action==='replaced'?'warn':'neutral')+(row.signal?.wyckoff?' '+WY_TRIANGLE:'')+'<div class="table-sub">'+status+'</div></td><td class="wy-evidence-text">'+esc(wyckoffEventReason(e))+' '+esc(wyckoffObservation(e))+(row.events.length>1?' 同日确认：'+row.events.map(x=>esc(x.type)+' '+esc(x.date)).join('、')+'。':'')+' '+esc(row.reason)+'</td></tr>';
  }).join('');
  return panel('威科夫量价 · 买卖信号明细','<div class="panel-body"><div class="wy-counts">'+pill('新增 '+counts.added,'good')+' '+pill('移除 / 过滤 '+counts.filtered,'warn')+' '+pill('同向支持 '+counts.supported)+' <span class="small muted">按当前回测区间统计 · 点击日期定位K线</span></div>'+(!w.model.ready?'<p class="small muted">'+esc(w.model.reason)+'</p>':'')+explanation+'</div><div class="table-wrap"><table class="wy-backtest-table"><thead><tr><th>信号日</th><th>量价方向 / 事件</th><th>候选日 / 验证日</th><th>策略处理 / 模拟订单</th><th>量价证据与理由</th></tr></thead><tbody>'+(rows||'<tr><td colspan="5" class="empty">本区间没有可用于调整信号的已验证事件。</td></tr>')+'</tbody></table></div>','','wy-backtest-panel');

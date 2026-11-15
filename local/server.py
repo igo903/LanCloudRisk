@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """RiskLens local research server. Python stdlib only; binds loopback by default."""
 import argparse
 import base64

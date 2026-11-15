@@ -118,7 +118,8 @@ test('integrated execution uses next session, and chart-ready signals follow the
  const original=E.backtest(data,'002281',p);assert.equal(original.orders.length,0);
  const on=E.backtest(data,'002281',{...p,wyckoff:true});assert.equal(on.signals[0].date,date(81));assert.equal(on.orders[0].signal,date(81));assert.equal(on.orders[0].date,date(82));assert.equal(on.orders[0].status,'模拟成交');
  assert.equal(E.backtest(data,'002281',{...p,wyckoff:true,marketGate:true}).orders[0].status,'未成交/跳过');
- const end=E.backtest(data,'002281',{...p,wyckoff:true,end:date(81)});assert.equal(end.signals.length,1);assert.equal(end.orders.length,0);
+ const end=E.backtest(data,'002281',{...p,wyckoff:true,end:date(81)});assert.equal(end.signals.length,1);
+ assert.equal(end.orders.length,1);assert.equal(end.orders[0].status,'区间外');assert.equal(end.fillCount,0);
  bars.push(continuation(83,{close:500,high:510,completed:false}));
  const live=E.backtest(data,'002281',{...p,wyckoff:true,end:date(83)});
  assert.deepEqual(live.openPosition,on.openPosition);assert.equal(live.openPosition.date,date(82));
