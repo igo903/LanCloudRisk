@@ -20,29 +20,31 @@ def daily(day='2026-11-20'):
 
 
 class SourcePriorityTests(unittest.TestCase):
-    def test_all_requested_etfs_stop_at_pingan(self):
-        symbols = ['sz159338', 'sz159915', 'sz159919', 'sz159901', 'sz159922', 'sh588080', 'sh515980']
-        with patch.object(app, 'load_pingan_quotes', return_value={s: quote(s) for s in symbols}) as pingan, \
-             patch.object(app, 'load_ifind_quotes') as ifind, patch.object(app, 'fetch') as public:
+    def test_all_requested_etfs_and_stocks_stop_at_tencent(self):
+        symbols = ['sz159338', 'sz159915', 'sz159919', 'sz159901', 'sz159922', 'sh588080', 'sh515980', 'sz002281']
+        with patch.object(app, 'load_pingan_quotes') as pingan, patch.object(app, 'load_eastmoney_quotes') as eastmoney, \
+             patch.object(app, 'load_ifind_quotes') as ifind, patch.object(app, 'fetch', return_value=b'fixture') as public, \
+             patch.object(app, 'parse_quotes', return_value={s: quote(s) for s in symbols}):
             result = app.load_cn_quotes(symbols)
         self.assertEqual(set(result), set(symbols))
-        self.assertEqual(pingan.call_args.args[0], symbols)
-        ifind.assert_not_called()
-        public.assert_not_called()
+        public.assert_called_once_with(app.QUOTE + ','.join(symbols))
+        for source in (pingan, eastmoney, ifind):
+            source.assert_not_called()
 
     def test_etf_partial_fallback_requests_only_uncovered_symbols_in_order(self):
         a, b, c = 'sz159338', 'sz159915', 'sz159919'
         trace = []
-        with patch.object(app, 'load_pingan_quotes', return_value={a: quote(a)}), \
-             patch.object(app, 'load_ifind_quotes', return_value={b: quote(b)}) as ifind, \
-             patch.object(app, 'parse_quotes', return_value={c: quote(c)}), \
-             patch.object(app, 'fetch', return_value=b'fixture') as fetch:
+        with patch.object(app, 'parse_quotes', return_value={a: quote(a)}), \
+             patch.object(app, 'load_eastmoney_quotes', return_value={b: quote(b)}) as eastmoney, \
+             patch.object(app, 'load_pingan_quotes', return_value={c: quote(c)}) as pingan, \
+             patch.object(app, 'load_ifind_quotes') as ifind, patch.object(app, 'fetch', return_value=b'fixture'):
             result = app.traced_quote_call(trace.append, '报价', 'ETF', app.load_cn_quotes, [a, b, c])
-        self.assertEqual(ifind.call_args.args[0], [b, c])
-        self.assertEqual(fetch.call_args.args[0], app.QUOTE + c)
+        self.assertEqual(eastmoney.call_args.args[0], [b, c])
+        self.assertEqual(pingan.call_args.args[0], [c])
+        ifind.assert_not_called()
         self.assertEqual(set(result), {a, b, c})
         self.assertEqual([(r['provider'], r['status']) for r in trace],
-                         [('平安证券报价', 'partial'), ('同花顺 iFinD 报价', 'partial'), ('腾讯报价', 'ok')])
+                         [('腾讯报价', 'partial'), ('东方财富报价', 'partial'), ('平安证券报价', 'ok')])
 
     def test_missing_timestamp_never_becomes_a_current_pingan_quote(self):
         item = {'code': 'SZ159338', 'name': 'ETF', 'price': 10, 'volume': 100}
@@ -78,17 +80,14 @@ class SourcePriorityTests(unittest.TestCase):
     def test_etf_history_fallback_and_stale_history_rejection(self):
         trace = []
         symbol = 'sz159338'
-        row = quote(symbol)
-        tencent = {'data': {symbol: {'day': [['2026-11-20', '10', '10', '11', '9', '100']]}}}
-        with patch.object(app, 'pingan_daily', return_value=(daily('2026-11-19'), 'pingan', 'qfq', '股/份')), \
-             patch.object(app, 'ifind_daily', side_effect=ValueError('同花顺无日线')), \
-             patch.object(app, 'fetch', return_value=json.dumps(tencent).encode()) as fetch:
+        with patch.object(app, 'fetch', side_effect=ValueError('腾讯 HTTP 403')), \
+             patch.object(app, 'eastmoney_cn_daily', return_value=(daily('2026-11-19'), 'eastmoney', 'none', '股/份')), \
+             patch.object(app, 'pingan_daily', return_value=(daily(), 'pingan', 'qfq', '股/份')):
             _, record = app.traced_quote_call(trace.append, '日线', symbol, app.load_asset,
-                                              ('159338', 'ETF', None), {symbol: row}, {'as_of': '2026-11-20'})
-        self.assertEqual(record['history_provider'], '腾讯')
-        self.assertIn('gtimg.cn', fetch.call_args.args[0])
-        self.assertEqual([r['provider'] for r in trace], ['平安证券日线', '同花顺 iFinD 日线', '腾讯日线'])
-        self.assertIn('早于缓存', trace[0]['detail'])
+                                              ('159338', 'ETF', None), {symbol: quote(symbol)}, {'as_of': '2026-11-20'})
+        self.assertEqual(record['history_provider'], '平安证券')
+        self.assertEqual([r['provider'] for r in trace], ['腾讯日线', '东方财富日线', '平安证券日线'])
+        self.assertIn('早于缓存', trace[1]['detail'])
 
     def test_ifind_parses_structured_daily_table_and_rejects_nav_and_unknown_units(self):
         columns = ['证券代码', '日期', '开盘价', '最高价', '最低价', '收盘价', '成交量', '成交量单位', '复权方式']
@@ -110,12 +109,13 @@ class SourcePriorityTests(unittest.TestCase):
         symbol = 'sz159338'
         with patch.object(app, 'pingan_daily', return_value=(daily(), 'pingan', 'qfq', '股/份')), \
              patch.object(app, 'ifind_daily', return_value=(rows, 'ifind', 'none', '股/份')), \
-             patch.object(app, 'fetch') as public:
+             patch.object(app, 'eastmoney_cn_daily', side_effect=ValueError('东方财富 HTTP 503')), \
+             patch.object(app, 'fetch', side_effect=ValueError('腾讯 HTTP 403')) as public:
             _, record = app.load_asset(('159338', 'ETF', None), {symbol: quote(symbol)}, previous)
         self.assertEqual(record['history_provider'], '同花顺 iFinD')
         self.assertEqual(len(record['bars']), 2)
-        self.assertIn('仅返回 1 根日线', record['fallback_errors'][0])
-        public.assert_not_called()
+        self.assertTrue(any('仅返回 1 根日线' in e for e in record['fallback_errors']))
+        public.assert_called_once()
 
     def test_malformed_pingan_payload_is_a_named_error(self):
         with patch.object(app, 'authenticated_market_json', return_value={'code': 0, 'data': []}):
@@ -130,38 +130,39 @@ class SourcePriorityTests(unittest.TestCase):
             bars, _, _, _ = app.ifind_daily('AAPL', 'US')
         self.assertEqual([r['vol'] for r in bars], [100, 200])
 
-    def test_us_history_attempts_five_sources_and_stops_at_first_valid_source(self):
-        methods = ('load_futu_stock', 'load_tencent_stock', 'read_yahoo_chart', 'load_ifind_stock', 'load_massive_stock')
-        patches = []
+    def test_us_and_hk_history_attempt_six_sources_and_stop_at_first_valid_source(self):
+        methods = ('load_futu_stock', 'read_yahoo_chart', 'load_tencent_stock', 'load_eastmoney_stock', 'load_ifind_stock', 'load_sina_stock')
+        mocks = []
         for name in methods:
             p = patch.object(app, name, side_effect=ValueError(name + ' unavailable'))
-            patches.append(p.start()); self.addCleanup(p.stop)
-        patches[-1].side_effect = None
-        patches[-1].return_value = app.daily_stock_record(US, daily(), 'fixture', 'America/New_York', 'Massive', 'fixture', 'provider', '')
-        trace = []
-        _, record = app.traced_quote_call(trace.append, '美股', 'US.AAPL', app.load_international_asset, US)
-        self.assertEqual([r['provider'] for r in trace], ['富途', '腾讯', 'Yahoo Finance', '同花顺 iFinD', 'Massive'])
-        self.assertEqual(record['history_provider'], 'Massive')
-        patches[1].side_effect = None
-        patches[1].return_value = {**patches[-1].return_value, 'history_provider': '腾讯'}
-        for mocked in patches:
+            mocks.append(p.start()); self.addCleanup(p.stop)
+        record = app.daily_stock_record(US, daily(), 'fixture', 'America/New_York', '新浪', 'fixture', 'provider', '')
+        mocks[-1].side_effect, mocks[-1].return_value = None, record
+        for market in ('US', 'HK'):
+            trace = []
+            meta = US if market=='US' else {**US,'market':'HK','code':'HK.00700','symbol':'00700','currency':'HKD'}
+            _, result = app.traced_quote_call(trace.append, '日线', meta['code'], app.load_international_asset, meta)
+            self.assertEqual([r['provider'] for r in trace], list(app.QUOTE_PRIORITIES['FOREIGN']))
+            self.assertEqual(result['history_provider'], '新浪')
+        mocks[2].side_effect, mocks[2].return_value = None, {**record, 'history_provider': '腾讯'}
+        for mocked in mocks:
             mocked.reset_mock()
-        _, record = app.load_international_asset(US)
-        self.assertEqual(record['history_provider'], '腾讯')
-        for mocked in patches[2:]:
+        _, result = app.load_international_asset(US)
+        self.assertEqual(result['history_provider'], '腾讯')
+        for mocked in mocks[3:]:
             mocked.assert_not_called()
 
-    def test_us_search_and_add_verify_use_tencent_before_yahoo(self):
+    def test_us_search_and_add_verify_use_yahoo_before_tencent(self):
         with patch.object(app, 'search_futu_securities', side_effect=ValueError('富途 unavailable')), \
-             patch.object(app, 'search_tencent_securities', return_value=[US]), \
-             patch.object(app, 'search_yahoo_securities') as yahoo, patch.object(app, 'SEARCH_CACHE', {}):
+             patch.object(app, 'search_yahoo_securities', return_value=[US]), \
+             patch.object(app, 'search_tencent_securities') as tencent, patch.object(app, 'SEARCH_CACHE', {}):
             self.assertEqual(app.search_securities('AAPL', 'US'), [US])
-            yahoo.assert_not_called()
+            tencent.assert_not_called()
         with patch.object(app, 'resolve_futu_security', side_effect=ValueError('富途 unavailable')), \
-             patch.object(app, 'resolve_tencent_security', return_value=dict(US)), \
-             patch.object(app, 'resolve_yahoo_security') as yahoo:
+             patch.object(app, 'resolve_yahoo_security', return_value=dict(US)), \
+             patch.object(app, 'resolve_tencent_security') as tencent:
             self.assertEqual(app.resolve_security('US', 'AAPL')['code'], US['code'])
-            yahoo.assert_not_called()
+            tencent.assert_not_called()
 
     def test_a50_and_usdcnh_use_futu_verified_codes_without_derivative_substitution(self):
         for symbol, code, name, kind in [('A50', 'GLOBAL.TESTA50', '富时中国A50指数', 'IDX'),

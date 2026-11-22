@@ -15,7 +15,7 @@ def fixture():
 
 class WatchlistTests(unittest.TestCase):
     def setUp(self):
-        for name in ('load_tencent_stock', 'load_ifind_stock'):
+        for name in ('load_tencent_stock', 'load_eastmoney_stock', 'load_ifind_stock', 'load_sina_stock'):
             mock = patch.object(app, name, side_effect=app.QuoteUnavailable('fixture source unavailable'))
             mock.start()
             self.addCleanup(mock.stop)
@@ -59,8 +59,9 @@ class WatchlistTests(unittest.TestCase):
         with patch.object(app, 'massive_daily', side_effect=lambda ticker: original_daily(ticker, current=current)), \
              patch.object(app, 'massive_json', return_value=payload) as massive, \
              patch.object(app, 'read_yahoo_chart', side_effect=ValueError('Yahoo HTTP 403')) as yahoo:
-            code, record = app.load_international_asset(meta)
-        yahoo.assert_called_once()
+            record = app.load_massive_stock(meta)
+            code = meta['code']
+        yahoo.assert_not_called()
         self.assertIn('/ticker/BRK.B/', massive.call_args.args[0])
         self.assertEqual((code, record['history_provider'], record['closed_as_of']), ('US.BRK-B', 'Massive', '2026-11-09'))
         self.assertFalse(record['bars'][-1]['completed'])

@@ -55,6 +55,13 @@ FUTU_API = 'https://webapi.futunn.com/api/v1.0/quote'
 PINGAN_QUOTE = 'https://ai.stock.pingan.com/restapi/hangqing/adapter/hangQing/stockDynamic'
 PINGAN_KLINE = 'https://ai.stock.pingan.com/restapi/hangqing/adapter/hangQing/klineData'
 TENCENT_US_KLINE = 'https://web.ifzq.gtimg.cn/appstock/app/usfqkline/get'
+EASTMONEY_QUOTE = 'https://push2.eastmoney.com/api/qt/stock/get'
+EASTMONEY_KLINE = 'https://push2his.eastmoney.com/api/qt/stock/kline/get'
+EASTMONEY_SEARCH = 'https://searchapi.eastmoney.com/api/suggest/get'
+QUOTE_PRIORITIES = {
+    'CN': ('腾讯', '东方财富', '平安证券', '同花顺 iFinD', '富途', '新浪'),
+    'FOREIGN': ('富途', 'Yahoo Finance', '腾讯', '东方财富', '同花顺 iFinD', '新浪'),
+}
 MARKET_KEY_SETTINGS = {
     'futu': ('富途', 'FUTU_API_KEY'),
     'massive': ('Massive', 'MASSIVE_API_KEY'),
@@ -116,6 +123,16 @@ def first_quote_source(routes, errors, *, date_of=None, not_before=None):
 
 def unsupported_quote(reason):
     raise QuoteUnavailable(reason)
+
+
+def quote_routes(market, loaders):
+    order = QUOTE_PRIORITIES['CN' if market == 'CN' else 'FOREIGN']
+    return tuple((provider, loaders.get(provider) or
+                  (lambda p=provider: unsupported_quote(p + '暂无该品种的已核验适配'))) for provider in order)
+
+
+def quote_source_label(provider, suffix):
+    return provider + (' ' if provider == '同花顺 iFinD' else '') + suffix
 
 
 class NoMarketRedirect(urllib.request.HTTPRedirectHandler):
@@ -993,6 +1010,8 @@ def ifind_matches(row, symbol, market):
     code = str(field_value(row, 'thscode', 'thsCode', 'code', 'symbol', '证券代码', '同花顺代码') or '').upper()
     if market == 'CN':
         return code in (symbol[2:], symbol[2:] + '.' + symbol[:2].upper())
+    if market == 'HK':
+        return bool(re.fullmatch(r'\d{1,5}\.HK', code) and code.split('.')[0].zfill(5) == symbol.zfill(5))
     expected = symbol.replace('-', '.').upper()
     # A qualified US ticker is required to avoid matching a Chinese/HK namesake.
     candidates = (expected + '.US', expected + '.O', expected + '.OQ', expected + '.N',
@@ -1001,13 +1020,14 @@ def ifind_matches(row, symbol, market):
 
 
 def ifind_daily(symbol, market='CN'):
-    service = 'fund' if market == 'CN' else 'global_stock'
-    tool = 'get_fund_market_performance' if market == 'CN' else 'global_stock_quotes'
-    subject = symbol[2:] + '.' + symbol[:2].upper() if market == 'CN' else '美股 ' + symbol
+    fund = market == 'CN' and is_cn_etf(symbol)
+    service = ('fund' if fund else 'stock') if market == 'CN' else 'global_stock'
+    tool = ('get_fund_market_performance' if fund else 'get_stock_performance') if market == 'CN' else 'global_stock_quotes'
+    subject = symbol[2:] + '.' + symbol[:2].upper() if market == 'CN' else ('港股 ' if market=='HK' else '美股 ') + symbol
     query = f'{subject} 最近640个交易日的每日开盘价、最高价、最低价、收盘价、成交量（股/份），不复权；返回证券代码、交易日期、成交量单位和复权方式的结构化表格，不要净值或累计净值。'
     result = ifind_tool(service, tool, {'query': query})
     bars, adjustments = {}, set()
-    today = quote_day(dt.datetime.now(dt.timezone.utc), 'Asia/Shanghai' if market == 'CN' else 'America/New_York')
+    today = quote_day(dt.datetime.now(dt.timezone.utc), 'Asia/Shanghai' if market in ('CN','HK') else 'America/New_York')
     for row in ifind_rows(result):
         if not ifind_matches(row, symbol, market):
             continue
@@ -1037,32 +1057,241 @@ def ifind_daily(symbol, market='CN'):
     return [bars[day] for day in sorted(bars)], IFIND_ENDPOINT.format(service), adjustments.pop(), '股/份'
 
 
+def eastmoney_search_rows(query):
+    url = EASTMONEY_SEARCH + '?' + urllib.parse.urlencode({'input': query, 'type': 14, 'count': 20})
+    table = (json.loads(fetch(url)).get('QuotationCodeTable') or {})
+    rows = table.get('Data')
+    if table.get('Status') not in (None, 0) or not isinstance(rows, list):
+        raise ValueError('东方财富证券搜索未返回有效列表')
+    return rows
+
+
+def eastmoney_security(row):
+    symbol, name = row.get('Code'), row.get('Name')
+    secid = str(row.get('QuoteID') or '')
+    if not isinstance(symbol, str) or not isinstance(name, str) or not name.strip() or re.search(r'[<>\x00-\x1f]', name):
+        return None
+    if not re.fullmatch(r'\d{1,3}\.[A-Za-z0-9.-]{1,20}', secid) or secid.split('.', 1)[1].upper() != symbol.upper():
+        return None
+    category, kind = row.get('Classify'), str(row.get('SecurityType'))
+    if category in ('AStock', 'Fund') and re.fullmatch(r'\d{6}', symbol) and secid.split('.')[0] in ('0', '1'):
+        provider_symbol = cn_provider_symbol(symbol)
+        if secid.split('.')[0] != ('1' if provider_symbol.startswith('sh') else '0'):
+            return None
+        return {'code': symbol, 'symbol': symbol, 'name': name[:100], 'market': 'CN', 'currency': 'CNY',
+                'type': 'etf' if category == 'Fund' else 'stock', 'provider_symbol': provider_symbol,
+                'eastmoney_secid': secid, 'search_source': '东方财富', 'watch': False, 'benchmark': False}
+    if category == 'HK' and secid.startswith('116.') and kind in ('19', '6'):
+        market, security_type = 'HK', 'etf' if kind == '6' else 'stock'
+    elif category == 'UsStock' and secid.split('.')[0] in ('105', '106', '107') and kind in ('7', '20'):
+        security_type = 'etf' if 'ETF' in name.upper() else 'stock'
+        if security_type == 'stock' and re.search(r'\b(notes?|bonds?|warrants?|rights?)\b|债券|认股权', name, re.I):
+            return None
+        market = 'US'
+    else:
+        return None
+    meta = foreign_security(market, symbol, name, security_type, '东方财富')
+    return {**meta, 'eastmoney_secid': secid} if meta else None
+
+
+def search_eastmoney_securities(query, market):
+    return [meta for row in eastmoney_search_rows(query) if isinstance(row, dict)
+            and (meta := eastmoney_security(row)) and (meta['market']==market or market=='ALL' and meta['market']!='CN')]
+
+
+def resolve_eastmoney_security(market, symbol, code):
+    meta = next((row for row in search_eastmoney_securities(symbol, market) if row['code'] == code), None)
+    if not meta:
+        raise ValueError('东方财富未核验同一市场的股票或 ETF')
+    return meta
+
+
+def eastmoney_secid(meta):
+    if meta['market'] == 'CN':
+        symbol = meta['provider_symbol']
+        if not re.fullmatch(r'(?:sh|sz|bj)\d{6}', symbol):
+            raise ValueError('东方财富 A股证券标识无效')
+        return ('1.' if symbol.startswith('sh') else '0.') + symbol[2:]
+    secid = meta.get('eastmoney_secid')
+    if secid:
+        expected = meta['symbol'].replace('-', '.').upper()
+        prefix, _, code = str(secid).partition('.')
+        if prefix not in (('116',) if meta['market']=='HK' else ('105', '106', '107')) or code.upper() != expected:
+            raise ValueError('东方财富证券标识与市场或代码不匹配')
+        return secid
+    return resolve_eastmoney_security(meta['market'], meta['symbol'], meta['code'])['eastmoney_secid']
+
+
+def eastmoney_quote(symbol):
+    secid = eastmoney_secid({'market': 'CN', 'provider_symbol': symbol})
+    url = EASTMONEY_QUOTE + '?' + urllib.parse.urlencode({'secid': secid, 'fltt': 2, 'invt': 2,
+        'fields': 'f13,f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f86,f168'})
+    payload = json.loads(fetch(url))
+    row = payload.get('data')
+    if payload.get('rc') != 0 or not isinstance(row, dict) or row.get('f57') != symbol[2:]:
+        raise ValueError('东方财富未返回同一 A股证券的报价')
+    if row.get('f13') is not None and str(row['f13']) != secid.split('.')[0]:
+        raise ValueError('东方财富报价市场身份不匹配')
+    instant = public_time(row.get('f86'))
+    price = number(row.get('f43'))
+    if instant is None or price is None or price <= 0:
+        raise ValueError('东方财富报价缺少有效价格或行情时间')
+    volume = number(row.get('f47'))
+    # fltt=2 already returns decimal prices. CN volume is reported in lots of 100 shares/units.
+    return {'code': symbol[2:], 'name': row.get('f58'), 'price': price, 'open': number(row.get('f46')),
+            'high': number(row.get('f44')), 'low': number(row.get('f45')), 'volume': volume*100 if volume is not None else None,
+            'amount': number(row.get('f48')), 'previous_close': number(row.get('f60')), 'turnover': number(row.get('f168')),
+            'timestamp': instant.isoformat(), 'date': instant.date().isoformat(), 'source': '东方财富行情',
+            'volume_basis': '手×100股/份', 'qualified_code': symbol.upper()}
+
+
+def load_eastmoney_quotes(symbols, failures):
+    quotes = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        jobs = {pool.submit(eastmoney_quote, symbol): symbol for symbol in symbols}
+        for future in concurrent.futures.as_completed(jobs):
+            symbol = jobs[future]
+            try:
+                quotes[symbol] = future.result()
+            except QUOTE_READ_ERRORS as exc:
+                failures.append(symbol + '：' + str(exc)[:130])
+    return quotes
+
+
+def eastmoney_daily(secid, timezone, *, cn=False, close_only=False):
+    url = EASTMONEY_KLINE + '?' + urllib.parse.urlencode({'secid': secid, 'klt': 101, 'fqt': 0,
+        'lmt': 640, 'end': dt.datetime.now(TZ).strftime('%Y%m%d'), 'fields1': 'f1,f2,f3,f4,f5,f6',
+        'fields2': 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61'})
+    payload = json.loads(fetch(url))
+    data = payload.get('data')
+    prefix, _, code = secid.partition('.')
+    if (payload.get('rc') != 0 or not isinstance(data, dict) or str(data.get('code', '')).upper() != code.upper()
+            or str(data.get('market')) != prefix or not isinstance(data.get('klines'), list)):
+        raise ValueError('东方财富未返回同一市场标的的日线')
+    today, rows = quote_day(dt.datetime.now(dt.timezone.utc), timezone), {}
+    for line in data['klines']:
+        if not isinstance(line, str):
+            continue
+        cells = line.split(',')
+        try:
+            day = dt.date.fromisoformat(cells[0])
+            o, c, h, l, v = map(number, cells[1:6])
+        except (ValueError, IndexError, TypeError):
+            continue
+        if None in (o, c, h, l) or (v is None and not close_only) or day>today or min(o,c)<=0 or not 0<l<=min(o,c) or h<max(o,c) or (v is not None and v<0):
+            continue
+        rows[day] = {'date': day.isoformat(), 'open': o, 'high': h, 'low': l, 'close': c,
+                     'vol': v*100 if cn and v is not None else v, 'netFlow': None, 'completed': day<today}
+    if not rows:
+        raise ValueError('东方财富未返回经过校验的 OHLCV 日线')
+    return [rows[day] for day in sorted(rows)], url
+
+
+def eastmoney_cn_daily(symbol):
+    rows, url = eastmoney_daily(eastmoney_secid({'market': 'CN', 'provider_symbol': symbol}), 'Asia/Shanghai', cn=True)
+    return rows, url, 'none', '股/份'
+
+
+def load_eastmoney_stock(meta):
+    timezone = 'Asia/Hong_Kong' if meta['market']=='HK' else 'America/New_York'
+    rows, url = eastmoney_daily(eastmoney_secid(meta), timezone)
+    record = daily_stock_record(meta, rows, url, timezone, '东方财富', '东方财富日线（未复权）', 'none',
+                                '东方财富交易所当地日频价格；当日日线未确认，成交量保留供应商原始单位。')
+    record['volume_unit'] = '供应商原始单位（仅计算量比）'
+    return record
+
+
+def load_eastmoney_global(asset):
+    symbol, name, ticker, _, kind, _ = asset
+    if symbol.startswith('us') and kind == 'equity':
+        meta = {'market': 'US', 'symbol': ticker, 'code': 'US.'+ticker}
+        secid, timezone = eastmoney_secid(meta), 'America/New_York'
+    else:
+        aliases = {
+            'A50': ('富时中国A50', '富时中国A50指数'), 'CNH': ('美元兑离岸人民币', '美元/离岸人民币'),
+            'DXY': ('美元指数',), 'DJI': ('道琼斯工业指数', '道琼斯工业平均指数'),
+            'IXIC': ('纳斯达克综合指数', '纳斯达克综指'), 'SOX': ('费城半导体指数',),
+            'N225': ('日经225', '日经225指数'), 'KOSPI': ('韩国综合指数',),
+            'hkHSTECH': ('恒生科技', '恒生科技指数'), 'usVIX': ('VIX波动率指数', '恐慌指数'),
+        }
+        if symbol not in aliases:
+            return unsupported_quote('东方财富暂无该品种已核验的同一价格口径映射')
+        candidates = []
+        for row in eastmoney_search_rows('USDCNH' if symbol=='CNH' else aliases[symbol][0]):
+            if not isinstance(row, dict) or row.get('Name') not in aliases[symbol]:
+                continue
+            if symbol=='CNH':
+                valid = row.get('Classify')=='FOREX' and row.get('Code')=='USDCNH'
+            else:
+                valid = row.get('SecurityTypeName')=='指数' and row.get('Classify') in ('UniversalIndex', 'Index')
+            secid = str(row.get('QuoteID') or '')
+            if valid and re.fullmatch(r'\d{1,3}\.[A-Za-z0-9.-]{1,20}', secid):
+                candidates.append(secid)
+        if len(set(candidates)) != 1:
+            return unsupported_quote('东方财富未唯一核验同一标的，拒绝使用 ETF、期货、其他指数或反向汇率替代')
+        secid = candidates[0]
+        timezone = {'CNH':'Asia/Shanghai','A50':'Asia/Shanghai','N225':'Asia/Tokyo',
+                    'KOSPI':'Asia/Seoul','hkHSTECH':'Asia/Hong_Kong'}.get(symbol,'America/New_York')
+    daily, url = eastmoney_daily(secid, timezone, close_only=True)
+    return {'history':[{'date':row['date'],'close':row['close']} for row in daily], 'timestamp':daily[-1]['date'],
+            'timezone':timezone, 'provisional':not daily[-1]['completed']}, url
+
+
+def load_futu_cn_quotes(symbols, failures):
+    quotes = {}
+    for start in range(0, len(symbols), 20):
+        batch = symbols[start:start+20]
+        try:
+            data = futu_json(FUTU_API+'/snapshot', data={'code_list': [s[:2].upper()+'.'+s[2:] for s in batch]}).get('data') or {}
+        except QuoteUnavailable:
+            raise
+        except QUOTE_READ_ERRORS as exc:
+            failures.append(str(exc)[:140])
+            continue
+        for row in data.get('snapshot_list') or []:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get('code', ''))
+            symbol = ticker.replace('.', '').lower()
+            if symbol not in batch:
+                continue
+            stamp = row.get('update_time') or row.get('update_timestamp')
+            if isinstance(stamp,str) and len(stamp)<16 and not re.fullmatch(r'\d{10,13}',stamp):
+                continue
+            instant = public_time(stamp)
+            price = number(row.get('last_price'))
+            if instant is None or price is None or price<=0:
+                continue
+            volume = number(row.get('volume'))
+            precision = row.get('volume_precision', data.get('volume_precision', 0))
+            volume = volume/10**precision if volume is not None and type(precision) is int and 0<=precision<=12 else None
+            quotes[symbol] = {'code': symbol[2:], 'name': row.get('sc_name') or row.get('name'), 'price': price,
+                              'open': number(row.get('open_price')), 'high': number(row.get('high_price')), 'low': number(row.get('low_price')),
+                              'volume': volume, 'amount': number(row.get('turnover')), 'previous_close': number(row.get('prev_close_price')),
+                              'turnover': number(row.get('turnover_rate')), 'timestamp': instant.isoformat(), 'date': instant.date().isoformat(),
+                              'source': '富途行情', 'volume_basis': '股/份', 'qualified_code': ticker}
+    return quotes
+
+
+def futu_cn_daily(symbol):
+    rows, url = futu_daily(symbol[:2].upper()+'.'+symbol[2:], 'Asia/Shanghai', adjusted=False)
+    return rows, url, 'none', '股/份'
+
+
 def is_cn_etf(symbol, meta=None):
     # Include on-exchange fund families so new ETF codes inherit the same policy.
     return (meta or {}).get('type') == 'etf' or symbol.startswith(('sh5', 'sz15', 'sz16'))
 
 
 def load_cn_quotes(symbols, *, issues=None, minimum=None, require_bar=False):
-    minimum = minimum or {}
-    groups = ([s for s in symbols if is_cn_etf(s, minimum.get(s))],
-              [s for s in symbols if not is_cn_etf(s, minimum.get(s))])
-    quotes, failures = {}, []
-    for etf, group in zip((True, False), groups):
-        if not group:
-            continue
-        sources = [('平安证券报价', load_pingan_quotes), ('同花顺 iFinD 报价', load_ifind_quotes),
-                   ('腾讯报价', lambda pending, _: parse_quotes(fetch(QUOTE + ','.join(pending)))),
-                   ('新浪报价', lambda pending, _: parse_sina_quotes(fetch(SINA_QUOTE + ','.join(pending))))] if etf else [
-                   ('腾讯报价', lambda pending, _: parse_quotes(fetch(QUOTE + ','.join(pending)))),
-                   ('同花顺 iFinD 报价', load_ifind_quotes),
-                   ('新浪报价', lambda pending, _: parse_sina_quotes(fetch(SINA_QUOTE + ','.join(pending))))]
-        try:
-            quotes.update(load_cn_quote_group(group, sources, issues=issues, minimum=minimum, require_bar=require_bar))
-        except ConnectionError as exc:
-            failures.append(str(exc))
-    if not quotes and failures:
-        raise ConnectionError('；'.join(failures))
-    return quotes
+    sources = quote_routes('CN', {
+        '腾讯': lambda pending, _: parse_quotes(fetch(QUOTE + ','.join(pending))),
+        '东方财富': load_eastmoney_quotes, '平安证券': load_pingan_quotes, '同花顺 iFinD': load_ifind_quotes,
+        '富途': load_futu_cn_quotes,
+        '新浪': lambda pending, _: parse_sina_quotes(fetch(SINA_QUOTE + ','.join(pending))),
+    })
+    return load_cn_quote_group(symbols, [(quote_source_label(p, '报价'), load) for p, load in sources],
+                               issues=issues, minimum=minimum, require_bar=require_bar)
 
 
 def load_cn_quote_group(symbols, sources, *, issues=None, minimum=None, require_bar=False):
@@ -1107,7 +1336,7 @@ def load_cn_quote_group(symbols, sources, *, issues=None, minimum=None, require_
                 failures.append(f'{invalid_identity} 个标的证券身份不匹配')
             if invalid_time:
                 failures.append(f'{invalid_time} 个标的报价时间缺失、过旧或晚于当前时间')
-        except (OSError, ValueError) as exc:
+        except QUOTE_READ_ERRORS as exc:
             failures.append(str(exc)[:165])
             unavailable = isinstance(exc, QuoteUnavailable)
         accepted = requested - len(remaining)
@@ -1189,9 +1418,11 @@ def load_asset(asset, quotes, previous=None):
         raw = fetch(url)
         rows = parse_sina(raw) if provider == '新浪日线' else parse_tencent(raw, symbol)
         return rows, url, 'none', '股/份' if provider == '新浪日线' else '供应商原始单位（仅计算量比）'
-    sources = [('平安证券日线', lambda: pingan_daily(symbol)), ('同花顺 iFinD 日线', lambda: ifind_daily(symbol)),
-               ('腾讯日线', lambda: public_daily('腾讯日线')), ('新浪日线', lambda: public_daily('新浪日线'))] if is_cn_etf(symbol) else [
-               ('腾讯日线', lambda: public_daily('腾讯日线')), ('新浪日线', lambda: public_daily('新浪日线'))]
+    sources = [(quote_source_label(p, '日线'), load) for p, load in quote_routes('CN', {
+        '腾讯': lambda: public_daily('腾讯日线'), '东方财富': lambda: eastmoney_cn_daily(symbol),
+        '平安证券': lambda: pingan_daily(symbol), '同花顺 iFinD': lambda: ifind_daily(symbol),
+        '富途': lambda: futu_cn_daily(symbol), '新浪': lambda: public_daily('新浪日线'),
+    })]
     for provider, load in sources:
         started = time.monotonic()
         try:
@@ -1796,32 +2027,21 @@ def futu_exact_external(symbol):
     return matches.pop(), 'Asia/Shanghai'
 
 
-def us_quote_routes(futu, tencent, yahoo, ifind, massive, sina):
-    return (('富途', futu), ('腾讯', tencent), ('Yahoo Finance', yahoo), ('同花顺 iFinD', ifind),
-            ('Massive', massive), ('新浪', sina))
-
-
 def load_global_asset(asset, not_before=None):
     symbol, name, ticker, unit, kind, weight = asset
     yahoo_link = 'https://finance.yahoo.com/quote/' + urllib.parse.quote(ticker, safe='') + '/'
     stock = symbol.startswith('us') and kind == 'equity'
-    massive_ticker = ticker if stock else MASSIVE_EXTERNAL.get(symbol)
     row = {'symbol': symbol, 'name': name, 'ticker': ticker, 'unit': unit, 'kind': kind, 'weight': RISK_WEIGHTS.get(symbol, weight),
            'url': yahoo_link, 'fetched_at': now()}
     errors = []
-    routes = (
-        ('富途', lambda: load_futu_global(symbol, ticker, stock)),
-        ('Yahoo Finance', lambda: read_yahoo_chart(ticker, 'range=2y&interval=1d',
-                                                 lambda data: parse_yahoo_global(data, kind), errors)),
-        ('Massive', lambda: load_massive_global(massive_ticker) if massive_ticker else
-         unsupported_quote('Massive 暂无可核验的同一标的代码')),
-    )
-    if stock or symbol in ('DJI', 'IXIC', 'SOX', 'usVIX'):
-        routes = us_quote_routes(routes[0][1], lambda: load_tencent_global(symbol, ticker, stock), routes[1][1],
-                                 lambda: load_ifind_global(symbol, ticker, stock), routes[2][1],
-                                 lambda: load_sina_global(symbol, ticker, stock))
-    else:
-        routes += (('新浪', lambda: load_sina_global(symbol, ticker, stock)),)
+    routes = quote_routes('FOREIGN', {
+        '富途': lambda: load_futu_global(symbol, ticker, stock),
+        'Yahoo Finance': lambda: read_yahoo_chart(ticker, 'range=2y&interval=1d', lambda data: parse_yahoo_global(data, kind), errors),
+        '腾讯': lambda: load_tencent_global(symbol, ticker, stock),
+        '东方财富': lambda: load_eastmoney_global(asset),
+        '同花顺 iFinD': lambda: load_ifind_global(symbol, ticker, stock),
+        '新浪': lambda: load_sina_global(symbol, ticker, stock),
+    })
     try:
         provider, (record, url) = first_quote_source(
             routes, errors, date_of=lambda result: result[0]['history'][-1]['date'], not_before=not_before)
@@ -1883,7 +2103,7 @@ def load_external(previous=()):
 
 
 QUOTE_PROVIDER_NAMES = {'腾讯公开行情': '腾讯', '新浪公开行情': '新浪', '同花顺 iFinD Level 1': '同花顺 iFinD',
-                        '平安证券行情': '平安证券'}
+                        '平安证券行情': '平安证券', '东方财富行情': '东方财富', '富途行情': '富途'}
 
 
 GPR_URL = 'https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.dta'
@@ -2289,31 +2509,68 @@ def search_tencent_securities(query, market):
     if market == 'US' and re.fullmatch(r'[A-Za-z][A-Za-z0-9-]{0,14}', query):
         query = query.replace('-', '.')
     url = 'https://smartbox.gtimg.cn/s3/?' + urllib.parse.urlencode({'q': query, 't': 'all'})
-    return parse_security_search(fetch(url), market)
+    return [row for row in parse_security_search(fetch(url), market) if market!='ALL' or row['market']!='CN']
 
 
 def ifind_security(row):
     code = str(field_value(row, 'thscode', 'thsCode', 'code', 'symbol', '证券代码', '同花顺代码') or '').upper()
-    if code.startswith('US.'):
+    if re.fullmatch(r'\d{1,5}\.HK', code):
+        symbol, market = code.split('.')[0].zfill(5), 'HK'
+    elif code.startswith('US.'):
         symbol = code[3:]
+        market = 'US'
     elif re.search(r'\.(?:US|OQ|O|N|A|P)$', code):
         symbol = code.rsplit('.', 1)[0]
+        market = 'US'
     elif row.get('market') == 'US':
         symbol = code
+        market = 'US'
     else:
         return None
     kind = str(field_value(row, 'type', 'security_type', '证券类型') or '').upper()
     kind = {'STOCK': 'stock', 'EQUITY': 'stock', '股票': 'stock', 'ETF': 'etf'}.get(kind)
     currency = field_value(row, 'currency', '币种', '交易币种')
-    if currency not in ('USD', '美元'):
+    if currency not in (('HKD','港元','港币') if market=='HK' else ('USD', '美元')):
         return None
-    return foreign_security('US', symbol, field_value(row, 'name', '证券简称', '证券名称'), kind, '同花顺 iFinD')
+    return foreign_security(market, symbol, field_value(row, 'name', '证券简称', '证券名称'), kind, '同花顺 iFinD')
 
 
-def search_ifind_securities(query):
+def search_ifind_securities(query, market='US'):
+    if market=='CN':
+        if not re.fullmatch(r'\d{6}', query):
+            return unsupported_quote('同花顺 A股证券核验当前支持精确六位代码')
+        symbol = cn_provider_symbol(query)
+        failures = []
+        quote = load_ifind_quotes([symbol], failures).get(symbol)
+        if not quote or not quote.get('name'):
+            raise ValueError('同花顺未返回同一 A股证券身份；'+'；'.join(failures))
+        return [cn_security_meta(symbol, quote['name'], '同花顺 iFinD')]
     result = ifind_tool('global_stock', 'global_stock_profile', {
-        'query': f'美股 {query} 的证券代码、证券简称、证券类型（股票或ETF）和交易币种，返回结构化表格。'})
-    return [meta for row in ifind_rows(result) if (meta := ifind_security(row))]
+        'query': f'{"港股" if market=="HK" else "港美股" if market=="ALL" else "美股"} {query} 的证券代码、证券简称、证券类型（股票或ETF）和交易币种，返回结构化表格。'})
+    return [meta for row in ifind_rows(result) if (meta := ifind_security(row)) and market in ('ALL',meta['market'])]
+
+
+def cn_provider_symbol(code):
+    if not re.fullmatch(r'\d{6}', code):
+        raise ValueError('需要六位 A股证券代码')
+    return ('bj' if code.startswith(('4','8','92')) else 'sh' if code.startswith(('5','6')) else 'sz')+code
+
+
+def cn_security_meta(symbol, name, provider):
+    return {'code':symbol[2:], 'symbol':symbol[2:], 'name':name, 'market':'CN', 'currency':'CNY',
+            'type':'etf' if is_cn_etf(symbol) else 'stock', 'provider_symbol':symbol,
+            'search_source':provider, 'watch':False, 'benchmark':False}
+
+
+def search_pingan_securities(query):
+    if not re.fullmatch(r'\d{6}', query):
+        return unsupported_quote('平安证券行情接口仅支持精确证券代码核验')
+    symbol = cn_provider_symbol(query)
+    data = pingan_json(PINGAN_QUOTE, {'codes':[symbol.upper()]})
+    for row in data['items']:
+        if isinstance(row,dict) and row.get('code')==symbol.upper() and row.get('name') and (number(row.get('price')) or 0)>0:
+            return [cn_security_meta(symbol,row['name'],'平安证券')]
+    raise ValueError('平安证券未返回同一股票或 ETF 的有效身份')
 
 
 def resolve_tencent_security(market, symbol, code):
@@ -2324,8 +2581,8 @@ def resolve_tencent_security(market, symbol, code):
     return meta
 
 
-def resolve_ifind_security(symbol, code):
-    meta = next((row for row in search_ifind_securities(symbol) if row['code'] == code), None)
+def resolve_ifind_security(symbol, code, market='US'):
+    meta = next((row for row in search_ifind_securities(symbol, market) if row['code'] == code), None)
     if meta is None:
         raise ValueError('同花顺未核验该美股或 ETF')
     return meta
@@ -2352,6 +2609,11 @@ def futu_security(row):
         return None
     market, symbol = ticker.split('.', 1)
     kind = {'STOCK': 'stock', 'ETF': 'etf'}.get(str(row.get('stock_type', row.get('sec_type'))).upper())
+    if market in ('SH','SZ','BJ') and re.fullmatch(r'\d{6}',symbol) and kind:
+        name = row.get('sc_name') or row.get('name')
+        if not isinstance(name,str) or not name.strip() or re.search(r'[<>\x00-\x1f]',name):
+            return None
+        return {**cn_security_meta(market.lower()+symbol,name.strip(),'富途'),'type':kind}
     return foreign_security(market, symbol, row.get('sc_name') or row.get('name'), kind, '富途')
 
 
@@ -2367,9 +2629,12 @@ def search_futu_securities(query, market):
     parsed, unknown = {}, []
     for row in candidates:
         code = row.get('code')
-        if not isinstance(code, str) or code.split('.', 1)[0] not in ('US', 'HK'):
+        if not isinstance(code, str) or code.split('.', 1)[0] not in ('US', 'HK', 'SH', 'SZ', 'BJ'):
             continue
-        if market != 'ALL' and not code.startswith(market + '.'):
+        row_market = 'CN' if code.split('.',1)[0] in ('SH','SZ','BJ') else code.split('.',1)[0]
+        if market == 'ALL' and row_market == 'CN':
+            continue
+        if market != 'ALL' and market != row_market:
             continue
         meta = futu_security(row)
         if meta:
@@ -2430,28 +2695,29 @@ def search_securities(query, market='ALL'):
     rows, errors = [], []
     if market in ('ALL', 'CN'):
         try:
-            _, rows = first_quote_source((('腾讯证券搜索', lambda: search_tencent_securities(query, 'CN')),
-                                          ('新浪', lambda: search_sina_securities(query, 'CN'))), errors)
+            _, rows = first_quote_source(quote_routes('CN', {
+                '腾讯': lambda: search_tencent_securities(query, 'CN'),
+                '东方财富': lambda: search_eastmoney_securities(query, 'CN'),
+                '平安证券': lambda: search_pingan_securities(query),
+                '同花顺 iFinD': lambda: search_ifind_securities(query, 'CN'),
+                '富途': lambda: search_futu_securities(query, 'CN'),
+                '新浪': lambda: search_sina_securities(query, 'CN'),
+            }), errors)
         except ValueError:
             if market == 'CN':
                 raise
     if market != 'CN':
         overseas_market = 'HK' if market == 'ALL' and re.fullmatch(r'\d{1,5}(?:\.HK)?', query, re.I) else market
         if not (market == 'ALL' and re.fullmatch(r'\d{6}', query)):
-            routes = (
-                ('富途', lambda: search_futu_securities(query, overseas_market)),
-                ('Yahoo Finance', lambda: search_yahoo_securities(query, overseas_market, errors)),
-                ('Massive', lambda: search_massive_securities(query) if overseas_market != 'HK' else
-                 unsupported_quote('Massive 股票接口不覆盖港股')),
-            )
-            if overseas_market in ('US', 'ALL'):
-                routes = us_quote_routes(routes[0][1], lambda: search_tencent_securities(query, overseas_market),
-                                         routes[1][1], lambda: search_ifind_securities(query), routes[2][1],
-                                         lambda: search_sina_securities(query, overseas_market))
-            else:
-                routes += (('新浪', lambda: search_sina_securities(query, overseas_market)),)
             try:
-                _, overseas = first_quote_source(routes, errors)
+                _, overseas = first_quote_source(quote_routes('FOREIGN', {
+                    '富途': lambda: search_futu_securities(query, overseas_market),
+                    'Yahoo Finance': lambda: search_yahoo_securities(query, overseas_market, errors),
+                    '腾讯': lambda: search_tencent_securities(query, overseas_market),
+                    '东方财富': lambda: search_eastmoney_securities(query, overseas_market),
+                    '同花顺 iFinD': lambda: search_ifind_securities(query, overseas_market),
+                    '新浪': lambda: search_sina_securities(query, overseas_market),
+                }), errors)
                 rows.extend(overseas)
             except ValueError:
                 if not rows:
@@ -2556,17 +2822,14 @@ def resolve_security(market, symbol):
     else:
         symbol = code.split('.', 1)[1]
         errors = []
-        routes = (
-            ('富途', lambda: resolve_futu_security(market, symbol, code)),
-            ('Yahoo Finance', lambda: resolve_yahoo_security(market, symbol, errors)),
-            ('Massive', lambda: resolve_massive_security(market, symbol, code)),
-        )
-        if market == 'US':
-            routes = us_quote_routes(routes[0][1], lambda: resolve_tencent_security(market, symbol, code),
-                                     routes[1][1], lambda: resolve_ifind_security(symbol, code), routes[2][1],
-                                     lambda: resolve_sina_security(market, symbol, code))
-        else:
-            routes += (('新浪', lambda: resolve_sina_security(market, symbol, code)),)
+        routes = quote_routes('FOREIGN', {
+            '富途': lambda: resolve_futu_security(market, symbol, code),
+            'Yahoo Finance': lambda: resolve_yahoo_security(market, symbol, errors),
+            '腾讯': lambda: resolve_tencent_security(market, symbol, code),
+            '东方财富': lambda: resolve_eastmoney_security(market, symbol, code),
+            '同花顺 iFinD': lambda: resolve_ifind_security(symbol, code, market),
+            '新浪': lambda: resolve_sina_security(market, symbol, code),
+        })
         _, meta = first_quote_source(routes, errors)
         meta['verified_name'] = meta['name']
     meta.update(watch=True, verified_at=now(), benchmark=code in BENCHMARK_CODES if market == 'CN' else False)
@@ -2636,17 +2899,11 @@ def load_international_asset(meta, previous=None):
                                        lambda result: parse_international_chart(result, meta), errors)
         return {**record, 'provider_url': url, 'history_provider': 'Yahoo Finance'}
 
-    routes = (
-        ('富途', lambda: load_futu_stock(meta)),
-        ('Yahoo Finance', yahoo),
-        ('Massive', lambda: load_massive_stock(meta) if meta['market'] == 'US' else
-         unsupported_quote('Massive 股票接口不覆盖港股')),
-    )
-    if meta['market'] == 'US':
-        routes = us_quote_routes(routes[0][1], lambda: load_tencent_stock(meta), routes[1][1],
-                                 lambda: load_ifind_stock(meta), routes[2][1], lambda: load_sina_stock(meta))
-    else:
-        routes += (('新浪', lambda: load_sina_stock(meta)),)
+    routes = quote_routes('FOREIGN', {
+        '富途': lambda: load_futu_stock(meta), 'Yahoo Finance': yahoo,
+        '腾讯': lambda: load_tencent_stock(meta), '东方财富': lambda: load_eastmoney_stock(meta),
+        '同花顺 iFinD': lambda: load_ifind_stock(meta), '新浪': lambda: load_sina_stock(meta),
+    })
     _, record = first_quote_source(routes, errors, date_of=lambda result: result['as_of'],
                                    not_before=(previous or {}).get('as_of'))
     record['fallback_errors'] = errors
@@ -2735,13 +2992,43 @@ def tencent_us_daily(meta=None, index=None):
 
 
 def load_tencent_stock(meta):
-    daily, url, adjustment, delayed = tencent_us_daily(meta)
-    source = '腾讯美股日线（' + ('前复权' if adjustment == 'qfq' else '未复权') + '）' + (' · 延迟' if delayed else '')
-    return daily_stock_record(meta, daily, url, 'America/New_York', '腾讯', source, adjustment,
-                              '腾讯美元常规时段日线，不含盘前盘后；纽约当地当日日线未确认。')
+    hk = meta['market']=='HK'
+    daily, url, adjustment, delayed = tencent_hk_daily(meta) if hk else tencent_us_daily(meta)
+    source = ('腾讯港股日线（' if hk else '腾讯美股日线（') + ('前复权' if adjustment == 'qfq' else '未复权') + '）' + (' · 延迟' if delayed else '')
+    record = daily_stock_record(meta, daily, url, 'Asia/Hong_Kong' if hk else 'America/New_York', '腾讯', source, adjustment,
+                                '腾讯本币常规时段日线，不含盘前盘后；交易所当地当日日线未确认。')
+    if hk:
+        record['volume_unit'] = '供应商原始单位（仅计算量比）'
+    return record
+
+
+def tencent_hk_daily(meta):
+    if not re.fullmatch(r'\d{5}',meta['symbol']):
+        raise ValueError('腾讯港股需要五位股票或 ETF 代码')
+    symbol = 'hk'+meta['symbol']
+    url = TENCENT+'?'+urllib.parse.urlencode({'param':symbol+',day,,,640,qfq'})
+    record = (json.loads(fetch(url)).get('data') or {}).get(symbol) or {}
+    quote = (record.get('qt') or {}).get(symbol) or []
+    if len(quote)<3 or quote[2]!=meta['symbol']:
+        raise ValueError('腾讯港股日线缺少同一标的报价身份')
+    today = quote_day(dt.datetime.now(dt.timezone.utc),'Asia/Hong_Kong')
+    rows = {}
+    for row in record.get('qfqday') or record.get('day') or []:
+        try:
+            date = dt.date.fromisoformat(row[0])
+            o,c,h,l,v = map(number,row[1:6])
+        except (ValueError,IndexError,TypeError):
+            continue
+        if date<=today and None not in (o,c,h,l,v) and 0<l<=min(o,c)<=max(o,c)<=h and v>=0:
+            rows[date] = {'date':date.isoformat(),'open':o,'close':c,'high':h,'low':l,'vol':v,'completed':date<today}
+    if not rows:
+        raise ValueError('腾讯未返回有效的港股 OHLCV 日线')
+    return [rows[date] for date in sorted(rows)],url,'qfq' if record.get('qfqday') else 'none',quote[0]=='delay'
 
 
 def load_tencent_global(symbol, ticker, stock):
+    if not stock and symbol not in ('DJI','IXIC','SOX','usVIX'):
+        return unsupported_quote('腾讯暂无该非股票品种已核验的同一标的日线适配')
     meta = {'code': 'US.' + ticker, 'symbol': ticker} if stock else None
     daily, url, _, delayed = tencent_us_daily(meta, None if stock else symbol)
     return {'history': [{'date': row['date'], 'close': row['close']} for row in daily],
@@ -2750,13 +3037,16 @@ def load_tencent_global(symbol, ticker, stock):
 
 
 def load_ifind_stock(meta):
-    daily, url, adjustment, _ = ifind_daily(meta['symbol'], 'US')
-    source = '同花顺 iFinD 美股日线（' + ('前复权' if adjustment == 'qfq' else '未复权') + '）'
-    return daily_stock_record(meta, daily, url, 'America/New_York', '同花顺 iFinD', source, adjustment,
-                              '同花顺美元日频行情；纽约当地当日数据未确认，不视为美股实时Level 1。')
+    daily, url, adjustment, _ = ifind_daily(meta['symbol'], meta['market'])
+    hk = meta['market']=='HK'
+    source = ('同花顺 iFinD 港股日线（' if hk else '同花顺 iFinD 美股日线（') + ('前复权' if adjustment == 'qfq' else '未复权') + '）'
+    return daily_stock_record(meta, daily, url, 'Asia/Hong_Kong' if hk else 'America/New_York', '同花顺 iFinD', source, adjustment,
+                              '同花顺本币日频行情；交易所当地当日数据未确认，不视为实时Level 1。')
 
 
 def load_ifind_global(symbol, ticker, stock):
+    if not stock and symbol not in ('DJI','IXIC','SOX','usVIX'):
+        return unsupported_quote('同花顺暂无该非股票品种已核验的同一标的日线适配')
     if not stock:
         names = {
             'DJI': ('道琼斯工业指数', '道琼斯工业平均指数', 'DOWJONESINDUSTRIALAVERAGE'),
@@ -2906,7 +3196,7 @@ def search_sina_securities(query, market):
             continue
         category, symbol, name = fields[1:3] + [fields[4]]
         m = {'41': 'US', '31': 'HK', '11': 'CN', '203': 'CN'}.get(category)
-        if not m or market not in ('ALL', m):
+        if not m or market not in ('ALL', m) or market=='ALL' and m=='CN':
             continue
         if m == 'CN':
             if not re.fullmatch(r'(?:sh|sz|bj)\d{6}', fields[3]):
@@ -3126,7 +3416,7 @@ class DataStore:
                     market = item['market']
                     if asset_id(market, item['symbol']) != item['code'] or item.get('type') not in ('stock', 'etf'):
                         continue
-                    safe = {k: item[k] for k in ['code', 'symbol', 'market', 'type', 'name', 'currency', 'provider_symbol', 'listed', 'timezone', 'verified_name', 'verified_at', 'tencent_symbol', 'search_source'] if k in item}
+                    safe = {k: item[k] for k in ['code', 'symbol', 'market', 'type', 'name', 'currency', 'provider_symbol', 'listed', 'timezone', 'verified_name', 'verified_at', 'tencent_symbol', 'eastmoney_secid', 'search_source'] if k in item}
                     if not isinstance(safe.get('name'), str) or len(safe['name']) > 100:
                         continue
                     if market == 'CN' and not re.fullmatch(r'(?:sh|sz|bj)\d{6}', safe.get('provider_symbol', '')):

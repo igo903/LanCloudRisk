@@ -22,7 +22,7 @@ def fixture():
 
 class GlobalDataTests(unittest.TestCase):
     def setUp(self):
-        for name in ('load_tencent_global', 'load_ifind_global'):
+        for name in ('load_tencent_global', 'load_eastmoney_global', 'load_ifind_global', 'load_sina_global'):
             mock = patch.object(app, name, side_effect=app.QuoteUnavailable('fixture source unavailable'))
             mock.start()
             self.addCleanup(mock.stop)
@@ -65,11 +65,10 @@ class GlobalDataTests(unittest.TestCase):
 
     def test_one_quote_does_not_manufacture_250_day_history(self):
         payload = {'status': 'DELAYED', 'ticker': 'SOXX', 'results': [{'t': 1793318400000, 'c': 100}]}
-        with patch.object(app, 'massive_json', return_value=payload), patch.object(app, 'fetch', side_effect=ValueError('Yahoo HTTP 403')) as public:
-            row = app.load_global_asset(next(r for r in app.GLOBAL_ASSETS if r[0] == 'usSOXX'))
-        self.assertEqual(public.call_count, 2)
-        self.assertEqual(row['provider'], 'Massive')
-        self.assertIn('延迟', row['source'])
+        with patch.object(app, 'massive_json', return_value=payload):
+            result, _ = app.load_massive_global('SOXX')
+        row = {**result, 'returns': app.external_changes(result['history'], 'equity')}
+        self.assertTrue(row['delayed'])
         self.assertEqual(len(row['history']), 1)
         self.assertIsNone(row['returns']['60']['value'])
         self.assertIsNone(row['returns']['250']['value'])
@@ -97,22 +96,21 @@ class GlobalDataTests(unittest.TestCase):
         self.assertTrue(any('403' in error for error in row['fallback_errors']))
         self.assertNotIn('error', row)
 
-    def test_global_fallback_records_five_sources_in_order_and_checks_identity(self):
-        asset = next(r for r in app.GLOBAL_ASSETS if r[0] == 'DJI')
-        blocked = app.urllib.error.HTTPError('https://finance.yahoo.com', 403, 'Forbidden', None, None)
-        payload = {'status': 'DELAYED', 'ticker': 'I:DJI', 'results': [{'t': 1793318400000, 'c': 102}]}
-        attempts = []
-        with patch.object(app, 'futu_daily', side_effect=app.QuoteUnavailable('未配置密钥')), \
-             patch.object(app, 'fetch', side_effect=blocked), patch.object(app, 'massive_json', return_value=payload):
-            row = app.traced_quote_call(attempts.append, '外围日线', 'DJI', app.load_global_asset, asset)
-        self.assertEqual((row['provider'], row['price']), ('Massive', 102))
-        self.assertEqual([(entry['provider'], entry['status']) for entry in attempts],
-                         [('富途', 'skipped'), ('腾讯', 'skipped'), ('Yahoo Finance', 'failed'),
-                          ('同花顺 iFinD', 'skipped'), ('Massive', 'ok')])
-        self.assertIn('403', attempts[2]['detail'])
-        with patch.object(app, 'fetch', side_effect=blocked), patch.object(app, 'massive_json', return_value={**payload, 'ticker': 'I:SOX'}):
-            row = app.load_global_asset(asset)
-        self.assertIn('身份不匹配', row['error'])
+    def test_global_fallback_records_six_sources_in_order(self):
+        for symbol in ('DJI', 'A50', 'CNH', 'BTC'):
+            asset = next(r for r in app.GLOBAL_ASSETS if r[0] == symbol)
+            attempts = []
+            result = ({'history': [{'date': '2026-11-20', 'close': 102}]}, 'fixture')
+            with self.subTest(symbol=symbol), \
+                 patch.object(app, 'load_futu_global', side_effect=app.QuoteUnavailable('未配置密钥')), \
+                 patch.object(app, 'read_yahoo_chart', side_effect=ValueError('Yahoo HTTP 403')), \
+                 patch.object(app, 'load_sina_global', return_value=result), patch.object(app, 'massive_json') as massive:
+                row = app.traced_quote_call(attempts.append, '外围日线', symbol, app.load_global_asset, asset)
+            self.assertEqual((row['provider'], row['price']), ('新浪', 102))
+            self.assertEqual([entry['provider'] for entry in attempts], list(app.QUOTE_PRIORITIES['FOREIGN']))
+            self.assertEqual([entry['status'] for entry in attempts], ['skipped','failed','skipped','skipped','skipped','ok'])
+            self.assertIn('403', attempts[1]['detail'])
+            massive.assert_not_called()
 
     def test_old_futu_index_history_falls_through_to_a_newer_source(self):
         asset = next(r for r in app.GLOBAL_ASSETS if r[0] == 'SOX')
@@ -125,7 +123,7 @@ class GlobalDataTests(unittest.TestCase):
         futu.assert_called_once_with('US..SOX', 'America/New_York', adjusted=False)
         self.assertEqual((row['provider'], row['price']), ('Yahoo Finance', 102))
         self.assertEqual([(entry['provider'], entry['status']) for entry in attempts],
-                         [('富途', 'failed'), ('腾讯', 'skipped'), ('Yahoo Finance', 'ok')])
+                         [('富途', 'failed'), ('Yahoo Finance', 'ok')])
         self.assertIn('早于缓存日期', attempts[0]['detail'])
 
     def test_futu_daily_uses_official_date_pagination_and_stops_before_fallback(self):
@@ -176,14 +174,14 @@ class GlobalDataTests(unittest.TestCase):
             self.assertIn('/ticker/' + ticker + '/', url)
             self.assertEqual((rows[-1]['date'], rows[-1]['completed']), (expected_date, completed))
 
-    def test_sox_uses_the_exact_massive_index_after_yahoo_fails(self):
-        sox = next(r for r in app.GLOBAL_ASSETS if r[0] == 'SOX')
+    def test_manual_massive_test_uses_exact_sox_index_and_checks_identity(self):
         payload = {'status': 'DELAYED', 'ticker': 'I:SOX', 'results': [{'t': 1793318400000, 'c': 10100.24}]}
-        with patch.object(app, 'massive_json', return_value=payload) as massive, \
-             patch.object(app, 'fetch', side_effect=ValueError('Yahoo HTTP 403')):
-            row = app.load_global_asset(sox)
+        with patch.object(app, 'massive_json', return_value=payload) as massive:
+            row, _ = app.load_massive_global('I:SOX')
         self.assertIn('/ticker/I:SOX/', massive.call_args.args[0])
-        self.assertEqual((row['provider'], row['price']), ('Massive', 10100.24))
+        self.assertEqual(row['history'][-1]['close'], 10100.24)
+        with patch.object(app, 'massive_json', return_value={**payload, 'ticker':'I:DJI'}), self.assertRaisesRegex(ValueError, '身份不匹配'):
+            app.load_massive_global('I:SOX')
 
     def test_wrong_ticker_identity_cannot_be_used(self):
         with patch.object(app, 'fetch', return_value=b'{"chart":{"result":[{"meta":{"symbol":"WRONG"}}]}}'):

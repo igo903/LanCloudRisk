@@ -69,7 +69,8 @@ class QuoteConnection(unittest.TestCase):
         raw = ('var hq_str_sz002281="' + ','.join(fields) + '";').encode('gb18030')
         refused = app.urllib.error.URLError(OSError(61, 'Connection refused'))
         self.assertTrue(app.connection_refused(refused))
-        with patch.object(app, 'fetch', side_effect=[refused, raw]) as fetch:
+        with patch.object(app, 'load_eastmoney_quotes', return_value={}), \
+             patch.object(app, 'fetch', side_effect=[refused, raw]) as fetch:
             quote = app.load_cn_quotes(['sz002281'])['sz002281']
         self.assertEqual(fetch.call_args.args[0], app.SINA_QUOTE + 'sz002281')
         self.assertEqual((quote['code'], quote['name'], quote['volume'], quote['source']),
@@ -84,12 +85,15 @@ class QuoteConnection(unittest.TestCase):
         issues = {}
         with patch.object(app, 'fetch', return_value=b'fixture') as fetch, \
              patch.object(app, 'parse_quotes', return_value={a: quotes[a]}), \
+             patch.object(app, 'load_eastmoney_quotes', return_value={}), \
+             patch.object(app, 'load_pingan_quotes', return_value={}), \
+             patch.object(app, 'load_futu_cn_quotes', return_value={}), \
              patch.object(app, 'parse_sina_quotes', return_value={b: quotes[b]}), \
              patch.object(app, 'load_ifind_quotes', return_value={c: quotes[c]}) as ifind:
             self.assertEqual(app.load_cn_quotes([a, b, c], issues=issues), quotes)
         self.assertEqual(fetch.call_args.args[0], app.SINA_QUOTE + b)
         self.assertEqual(ifind.call_args.args[0], [b, c])
-        self.assertEqual(list(issues), ['腾讯报价', '同花顺 iFinD 报价'])
+        self.assertEqual(list(issues), ['腾讯报价', '东方财富报价', '平安证券报价', '同花顺 iFinD 报价', '富途报价'])
 
     def test_ex_dividend_prefix_and_truncation_preserve_identity(self):
         symbol = 'sh601869'
@@ -167,10 +171,9 @@ class QuoteConnection(unittest.TestCase):
                 store.refresh()
         self.assertEqual(store.state['price_result'], 'failed')
         self.assertIs(store.snapshot, old)
-        self.assertEqual(list(store.state['quote_sources']['初始报价']), ['平安证券报价', '同花顺 iFinD 报价', '腾讯报价', '新浪报价'])
+        self.assertEqual(list(store.state['quote_sources']['初始报价']), ['腾讯报价', '东方财富报价', '平安证券报价', '同花顺 iFinD 报价', '富途报价', '新浪报价'])
         self.assertIn('未配置', store.state['quote_sources']['初始报价']['同花顺 iFinD 报价'])
-        self.assertEqual([row['provider'] for row in first_run], ['平安证券报价', '同花顺 iFinD 报价', '腾讯报价', '新浪报价',
-                                                               '腾讯报价', '同花顺 iFinD 报价', '新浪报价'])
+        self.assertEqual([row['provider'] for row in first_run], ['腾讯报价', '东方财富报价', '平安证券报价', '同花顺 iFinD 报价', '富途报价', '新浪报价'])
         self.assertIsNot(store.state['quote_attempts'], first_run)
         self.assertNotIn('quote_attempt_history', store.state)
 

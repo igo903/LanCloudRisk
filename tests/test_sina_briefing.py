@@ -26,7 +26,7 @@ def component(score=50, coverage=1):
 class SinaFallbackTests(unittest.TestCase):
     def test_us_history_calls_sina_only_after_the_other_five_sources_fail(self):
         meta = {'code': 'US.AAPL', 'symbol': 'AAPL', 'name': '苹果', 'market': 'US', 'currency': 'USD'}
-        for name in ('load_futu_stock', 'load_tencent_stock', 'read_yahoo_chart', 'load_ifind_stock', 'load_massive_stock'):
+        for name in ('load_futu_stock', 'read_yahoo_chart', 'load_tencent_stock', 'load_eastmoney_stock', 'load_ifind_stock'):
             p = patch.object(app, name, side_effect=ValueError(name + ' unavailable'))
             p.start(); self.addCleanup(p.stop)
         record = {'bars': [], 'as_of': instant(1).date().isoformat(), 'history_provider': '新浪', 'completed': False}
@@ -34,7 +34,7 @@ class SinaFallbackTests(unittest.TestCase):
         with patch.object(app, 'load_sina_stock', return_value=record) as sina:
             _, result = app.traced_quote_call(trace.append, '日线', 'US.AAPL', app.load_international_asset, meta)
         self.assertEqual(result['history_provider'], '新浪')
-        self.assertEqual([r['provider'] for r in trace], ['富途', '腾讯', 'Yahoo Finance', '同花顺 iFinD', 'Massive', '新浪'])
+        self.assertEqual([r['provider'] for r in trace], list(app.QUOTE_PRIORITIES['FOREIGN']))
         sina.assert_called_once_with(meta)
 
     def test_etf_daily_sina_is_last_and_keeps_its_share_volume_units(self):
@@ -47,13 +47,15 @@ class SinaFallbackTests(unittest.TestCase):
             return ('var _=('+json.dumps(rows)+');').encode()
         trace = []
         with patch.object(app, 'pingan_daily', side_effect=app.QuoteUnavailable('未配置')), \
-             patch.object(app, 'ifind_daily', side_effect=app.QuoteUnavailable('未配置')), patch.object(app, 'fetch', side_effect=fetch):
+             patch.object(app, 'ifind_daily', side_effect=app.QuoteUnavailable('未配置')), \
+             patch.object(app, 'eastmoney_cn_daily', side_effect=ValueError('东方财富 HTTP 503')), \
+             patch.object(app, 'futu_cn_daily', side_effect=app.QuoteUnavailable('未配置')), patch.object(app, 'fetch', side_effect=fetch):
             _, record = app.traced_quote_call(trace.append, '日线', '159338', app.load_asset,
                                               ('159338', 'ETF', None), {'sz159338': quote})
         self.assertEqual(record['history_provider'], '新浪')
         self.assertEqual(record['volume_unit'], '股/份')
         self.assertEqual(record['bars'][0]['vol'], 1234)
-        self.assertEqual([r['provider'] for r in trace], ['平安证券日线', '同花顺 iFinD 日线', '腾讯日线', '新浪日线'])
+        self.assertEqual([r['provider'] for r in trace], ['腾讯日线', '东方财富日线', '平安证券日线', '同花顺 iFinD 日线', '富途日线', '新浪日线'])
 
     def test_sina_forex_uses_close_and_preserves_usdcnh_direction(self):
         date = instant(1).date().isoformat()
