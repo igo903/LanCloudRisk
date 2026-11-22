@@ -121,7 +121,7 @@ class CachePermissions(unittest.TestCase):
         with patch.object(app, 'ASSETS', assets), patch.object(app, 'SECTOR_ASSETS', []), \
              patch.object(app, 'fetch', return_value=b''), \
              patch.object(app, 'parse_quotes', return_value=quotes), \
-             patch.object(app, 'load_asset', side_effect=lambda a, q: (a[0], copy.deepcopy(record))), \
+             patch.object(app, 'load_asset', side_effect=lambda a, q, previous=None: (a[0], copy.deepcopy(record))), \
              patch.object(app, 'verify_previous'), patch.object(app, 'patch_quote'), \
              patch.object(app, 'load_financials', return_value=({'shares': 100, 'profitTTM': 10, 'revenueTTM': 20, 'bps': 1}, [])) as financials, \
              patch.object(app, 'load_holdings', return_value={'rows': []}), \

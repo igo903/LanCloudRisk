@@ -27,9 +27,19 @@ test('all 15 expected assets remain in the denominator when providers fail',()=>
  const rows=[{symbol:'usSOXX',kind:'equity',history:history()}],g=R.globalRisk(rows,{},today);
  near(g.coverage,.10);assert.equal(g.assets.length,15);near(g.low,g.score*.10);
 });
-test('GPR data exceeding 14 calendar days is excluded rather than scored as safe',()=>{
+test('legacy GPR cannot masquerade as the new three-source political or war assessment',()=>{
  const g=R.globalRisk([],{as_of:'2026-10-01',items:[{kind:'war',score:99},{kind:'politics',score:99}]},today);assert.equal(g.score,null);
- const fresh=R.globalRisk([],{as_of:'2026-10-26',items:[{kind:'war',score:99},{kind:'politics',score:20}]},today);near(fresh.coverage,.2);near(fresh.score,59.5);
+ const fresh=R.globalRisk([],{as_of:'2026-10-26',items:[{kind:'war',score:99},{kind:'politics',score:20}]},today);near(fresh.coverage,0);assert.equal(fresh.score,null);
+});
+test('three-source geopolitical evidence propagates fractional coverage into global risk',()=>{
+ const components=[{id:'news',score:80,coverage:.5,as_of:'2026-10-30'},{id:'community',score:60,coverage:1,as_of:'2026-10-30'},{id:'gap',score:40,coverage:1,as_of:'2026-10-30'}];
+ const geo={method:'public-evidence-v2',items:[{kind:'politics',components}]};
+ const model=R.geopoliticalRisk(geo,'politics',today);near(model.coverage,.8);near(model.score,(80*20+60*25+40*35)/80);
+ const total=R.globalRisk([],geo,today);near(total.coverage,.08);near(total.score,model.score);
+});
+test('fresh generation time cannot revive independently expired community or news samples',()=>{
+ const geo={method:'public-evidence-v2',fetched_at:'2026-11-01',items:[{kind:'war',components:[{id:'news',score:99,coverage:1,as_of:'2026-10-01'},{id:'community',score:99,coverage:1,as_of:'2026-10-27'},{id:'gap',score:20,coverage:1,as_of:'2026-10-30'}]}]};
+ const model=R.geopoliticalRisk(geo,'war',today);near(model.coverage,.35);near(model.score,20);assert.equal(model.parts[0].score,null);assert.equal(model.parts[1].score,null);
 });
 test('ETF assessment handles missing NAV and does not apply company financial ratios',()=>{
  const r=R.watchRisk({bars:history()}, {code:'588080',type:'etf'},R.aggregate([]),today);

@@ -21,6 +21,12 @@ def fixture():
 
 
 class GlobalDataTests(unittest.TestCase):
+    def setUp(self):
+        for name in ('load_tencent_global', 'load_ifind_global'):
+            mock = patch.object(app, name, side_effect=app.QuoteUnavailable('fixture source unavailable'))
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_n_period_change_requires_n_plus_one_samples(self):
         rows = [{'date': f'd{i}', 'close': 100+i} for i in range(251)]
         result = app.external_changes(rows, 'equity')
@@ -91,7 +97,7 @@ class GlobalDataTests(unittest.TestCase):
         self.assertTrue(any('403' in error for error in row['fallback_errors']))
         self.assertNotIn('error', row)
 
-    def test_global_fallback_records_three_sources_in_order_and_checks_identity(self):
+    def test_global_fallback_records_five_sources_in_order_and_checks_identity(self):
         asset = next(r for r in app.GLOBAL_ASSETS if r[0] == 'DJI')
         blocked = app.urllib.error.HTTPError('https://finance.yahoo.com', 403, 'Forbidden', None, None)
         payload = {'status': 'DELAYED', 'ticker': 'I:DJI', 'results': [{'t': 1793318400000, 'c': 102}]}
@@ -101,8 +107,9 @@ class GlobalDataTests(unittest.TestCase):
             row = app.traced_quote_call(attempts.append, '外围日线', 'DJI', app.load_global_asset, asset)
         self.assertEqual((row['provider'], row['price']), ('Massive', 102))
         self.assertEqual([(entry['provider'], entry['status']) for entry in attempts],
-                         [('富途', 'skipped'), ('Yahoo Finance', 'failed'), ('Massive', 'ok')])
-        self.assertIn('403', attempts[1]['detail'])
+                         [('富途', 'skipped'), ('腾讯', 'skipped'), ('Yahoo Finance', 'failed'),
+                          ('同花顺 iFinD', 'skipped'), ('Massive', 'ok')])
+        self.assertIn('403', attempts[2]['detail'])
         with patch.object(app, 'fetch', side_effect=blocked), patch.object(app, 'massive_json', return_value={**payload, 'ticker': 'I:SOX'}):
             row = app.load_global_asset(asset)
         self.assertIn('身份不匹配', row['error'])
@@ -118,7 +125,7 @@ class GlobalDataTests(unittest.TestCase):
         futu.assert_called_once_with('US..SOX', 'America/New_York', adjusted=False)
         self.assertEqual((row['provider'], row['price']), ('Yahoo Finance', 102))
         self.assertEqual([(entry['provider'], entry['status']) for entry in attempts],
-                         [('富途', 'failed'), ('Yahoo Finance', 'ok')])
+                         [('富途', 'failed'), ('腾讯', 'skipped'), ('Yahoo Finance', 'ok')])
         self.assertIn('早于缓存日期', attempts[0]['detail'])
 
     def test_futu_daily_uses_official_date_pagination_and_stops_before_fallback(self):
@@ -186,7 +193,7 @@ class GlobalDataTests(unittest.TestCase):
 
     def test_percentiles_require_at_least_252_rolling_samples(self):
         with patch.object(app, 'fetch', return_value=fixture()):
-            row = app.load_geopolitics()
+            row = app.load_gpr_history()
         self.assertTrue(all(r['score'] is None for r in row['items']))
 
 

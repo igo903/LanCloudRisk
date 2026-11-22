@@ -14,6 +14,11 @@ def fixture():
     return {'meta':{'symbol':'NVDA','currency':'USD','exchangeTimezoneName':'America/New_York','currentTradingPeriod':{'regular':{'start':stamp('2026-11-02T14:30:00+00:00'),'end':stamp('2026-11-02T21:00:00+00:00')}}},'timestamp':[stamp('2026-10-30T13:30:00+00:00'),stamp('2026-11-02T14:30:00+00:00')],'indicators':{'quote':[{'open':[100,101],'high':[102,103],'low':[99,100],'close':[101,102],'volume':[123,234]}]}}
 
 class WatchlistTests(unittest.TestCase):
+    def setUp(self):
+        for name in ('load_tencent_stock', 'load_ifind_stock'):
+            mock = patch.object(app, name, side_effect=app.QuoteUnavailable('fixture source unavailable'))
+            mock.start()
+            self.addCleanup(mock.stop)
     def store(self,path):
         with patch.object(app,'cache_locations',return_value=[Path(path)]):return app.DataStore(path)
     def test_search_filters_security_types_and_preserves_market_identity(self):

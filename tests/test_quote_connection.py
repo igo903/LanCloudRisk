@@ -78,7 +78,7 @@ class QuoteConnection(unittest.TestCase):
         self.assertIsNone(quote['turnover'])
 
     def test_partial_sources_query_only_uncovered_symbols_and_keep_attempts(self):
-        a, b, c = 'sz002281', 'sh601869', 'sh588080'
+        a, b, c = 'sz002281', 'sh601869', 'sh600000'
         stamp = '2026-10-30T13:20:00+08:00'
         quotes = {s: {'code': s[2:], 'name': s, 'timestamp': stamp, 'price': 10} for s in (a, b, c)}
         issues = {}
@@ -87,9 +87,9 @@ class QuoteConnection(unittest.TestCase):
              patch.object(app, 'parse_sina_quotes', return_value={b: quotes[b]}), \
              patch.object(app, 'load_ifind_quotes', return_value={c: quotes[c]}) as ifind:
             self.assertEqual(app.load_cn_quotes([a, b, c], issues=issues), quotes)
-        self.assertEqual(fetch.call_args.args[0], app.SINA_QUOTE + b + ',' + c)
-        self.assertEqual(ifind.call_args.args[0], [c])
-        self.assertEqual(list(issues), ['腾讯报价', '新浪报价'])
+        self.assertEqual(fetch.call_args.args[0], app.SINA_QUOTE + b)
+        self.assertEqual(ifind.call_args.args[0], [b, c])
+        self.assertEqual(list(issues), ['腾讯报价', '同花顺 iFinD 报价'])
 
     def test_ex_dividend_prefix_and_truncation_preserve_identity(self):
         symbol = 'sh601869'
@@ -167,9 +167,10 @@ class QuoteConnection(unittest.TestCase):
                 store.refresh()
         self.assertEqual(store.state['price_result'], 'failed')
         self.assertIs(store.snapshot, old)
-        self.assertEqual(list(store.state['quote_sources']['初始报价']), ['腾讯报价', '新浪报价', '同花顺 iFinD 报价'])
+        self.assertEqual(list(store.state['quote_sources']['初始报价']), ['平安证券报价', '同花顺 iFinD 报价', '腾讯报价', '新浪报价'])
         self.assertIn('未配置', store.state['quote_sources']['初始报价']['同花顺 iFinD 报价'])
-        self.assertEqual([row['provider'] for row in first_run], ['腾讯报价', '新浪报价', '同花顺 iFinD 报价'])
+        self.assertEqual([row['provider'] for row in first_run], ['平安证券报价', '同花顺 iFinD 报价', '腾讯报价', '新浪报价',
+                                                               '腾讯报价', '同花顺 iFinD 报价', '新浪报价'])
         self.assertIsNot(store.state['quote_attempts'], first_run)
         self.assertNotIn('quote_attempt_history', store.state)
 

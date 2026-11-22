@@ -25,6 +25,8 @@ const CATALOG=[
 const BENCH_CODES=['510300','159338','510500','512100','159915','588080'];
 const WATCH_CODES=CATALOG.filter(asset=>asset.watch).map(asset=>asset.code);
 const SKILL_MAP=[
+ {name:'富途新闻搜索',id:'futu-news-search',version:'0.0.4',pages:'风险总览 B1 / B2',detail:'本轮相关报道、发布时间、原文链接与文本线索；不把标题等同官方确认。',url:'https://chatgpt.com/skills?skill_id=6af3e104147481918a1cda851a5521d9'},
+ {name:'富途社区情绪',id:'futu-comment-sentiment',version:'0.0.4',pages:'风险总览 B1 / B2',detail:'主题相关讨论去重、去广告后统计多空分布，展示样本窗口与代表观点。',url:'https://chatgpt.com/skills?skill_id=6af3e0e48ac08191893917050683d9de'},
  {name:'市场情绪偏离分析',id:'market-sentiment-gap',version:'安装版',pages:'情绪偏离 / 七维情绪',detail:'负面情绪、财务健康、竞争力、问题性质、催化剂与反证。',url:'https://chatgpt.com/skills?skill_id=6ae415e62d6481919824b65893ebcd7c'},
  {name:'科技炒作与基本面',id:'tech-hype-fundamentals',version:'安装版',pages:'估值与基本面 / 七维估值',detail:'企业阶段、估值口径、盈利质量、现金流、研发与概念收入兑现。',url:'https://chatgpt.com/skills?skill_id=6ae416045a888191ae42d64503e3fc4a'},
  {name:'量化因子选股',id:'ashare-factor-screening',version:'安装版',pages:'多因子筛选 / 个股画像',detail:'价值、动量、质量、低波动、规模、成长；子指标截面排名与权重。',url:'https://chatgpt.com/skills?skill_id=6ae41617f7408191a84fa00a9b1ba249'},
