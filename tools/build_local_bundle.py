@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ['index.html', 'styles.css', 'workbench.css', 'data.js', 'engine.js',
           'app.js', 'lightweight-charts.js', 'lightweight-charts.LICENSE.txt',
           'interactive-chart.js', 'evidence-views.js', 'views.js',
-          'local-connector.js', 'research-views.js', 'strategy-views.js', 'record-ui.js', 'user-state.js', 'themes.css', 'risk.css', 'risk-engine.js', 'risk-views.js', 'market-cards.js', 'market-cards.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'bootstrap.js', 'wyckoff-engine.js', 'wyckoff-views.js', 'wyckoff.css']
+          'local-connector.js', 'research-views.js', 'strategy-views.js', 'record-ui.js', 'user-state.js', 'themes.css', 'risk.css', 'risk-engine.js', 'risk-views.js', 'market-cards.js', 'market-cards.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'bootstrap.js', 'wyckoff-engine.js', 'wyckoff-views.js', 'wyckoff.css', 'stock-research.js', 'stock-research.css', 'futu-account.js', 'futu-account.css', 'install_futu_cli.py']
 
 
 def main():
@@ -20,7 +20,7 @@ def main():
     tree = ast.parse(source)
     guard = next(node for node in tree.body if isinstance(node, ast.If)
                  and ast.unparse(node.test) == "__name__ == '__main__'")
-    assets = {name: (ROOT / 'dist' / name).read_text(encoding='utf-8') for name in ASSETS}
+    assets = {name: (ROOT / ('tools' if name == 'install_futu_cli.py' else 'dist') / name).read_text(encoding='utf-8') for name in ASSETS}
     lines = source.splitlines(keepends=True)
     assignment = 'EMBEDDED_ASSETS = json.loads(' + repr(json.dumps(assets, ensure_ascii=False)) + ')\n\n'
     lines.insert(guard.lineno - 1, assignment)

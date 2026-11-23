@@ -3260,6 +3260,248 @@ def load_watch_record(meta, previous=None, quotes=None):
     return code, record
 
 
+# Independent research evidence: never changes prices, historical factors or order signals.
+STOCK_RESEARCH_SOURCES = {'pingan': '平安证券资金查询', 'futu_capital': '富途资金异动',
+                          'ifind': '同花顺经营与披露', 'futu_news': '富途新闻'}
+STOCK_RESEARCH_FIELDS = {
+    '行业': ('industry', 'text'), '主营业务': ('business', 'text'), '主要产品': ('products', 'text'),
+    '主营构成': ('segments', 'text'), '主营业务收入占比': ('business_share', 'percent'),
+    '营收同比': ('revenue_growth', 'percent'), '归母净利同比': ('profit_growth', 'percent'),
+    '毛利率': ('gross_margin', 'percent'), '经营活动现金流净额': ('operating_cash', 'amount'),
+    '资本开支': ('capex', 'amount'), 'ROIC': ('roic', 'percent'),
+    '研发资本化比例': ('rd_capitalization', 'percent'), '股份支付费用': ('sbc', 'amount'),
+}
+
+
+def research_symbol(meta):
+    if meta['market'] == 'CN':
+        symbol = meta.get('provider_symbol') or cn_provider_symbol(meta['code'])
+        if not re.fullmatch(r'(?:sh|sz|bj)\d{6}', symbol):
+            raise ValueError('研究证券代码无效')
+        return symbol[:2].upper()+'.'+symbol[2:]
+    return asset_id(meta['market'], meta['symbol'])
+
+
+def research_error(exc):
+    # Errors must not leak a CLI credential, a response body or a local private-key path.
+    if isinstance(exc, QuoteUnavailable):
+        return str(exc)[:220]
+    if isinstance(exc, urllib.error.HTTPError):
+        return 'HTTP '+str(exc.code)+'：行情服务请求失败'
+    if isinstance(exc, (OSError, subprocess.TimeoutExpired)):
+        return '网络或本机调用失败：'+type(exc).__name__
+    code = re.search(r'HTTP\s+\d{3}|错误码\s+-?\d+', str(exc))
+    return ('服务调用失败（'+code[0]+'）') if code else '数据校验或服务调用失败：'+type(exc).__name__
+
+
+def stock_pingan_evidence(meta):
+    if meta['market'] != 'CN':
+        raise QuoteUnavailable('平安证券资金接口仅用于 A 股股票')
+    symbol = research_symbol(meta).replace('.', '')
+    url = PINGAN_QUOTE.rsplit('/', 1)[0]+'/capitalFlow'
+    data = pingan_json(url, {'codes': [symbol]})
+    row = next((r for r in data['items'] if isinstance(r, dict) and r.get('code') == symbol), None)
+    if row is None or number(row.get('main_net_inflow')) is None:
+        raise ValueError('未返回同一证券的有效资金统计')
+    instant = public_time(field_value(row, 'timestamp', 'quote_time', 'time', 'update_time'))
+    # This endpoint may omit observation time. Keep that omission, never stamp it as today's flow.
+    return {'source': '平安证券', 'url': url, 'as_of': instant.isoformat() if instant else None,
+            'currency': 'CNY', 'time_missing': instant is None,
+            'metrics': {key: number(row.get(key)) for key in ('main_net_inflow', 'super_large_net_inflow',
+                'large_net_inflow', 'main_net_inflow_pct', 'amount')},
+            'basis': '供应商超大单+大单分类统计，不代表机构身份；金额单位元。'}
+
+
+def futu_cli_path():
+    executable = shutil.which('futu')
+    candidates = [Path.home()/'.futu/bin/futu', Path(os.getenv('LOCALAPPDATA') or str(Path.home()))/'FutuCLI/bin/futu.exe']
+    return executable or next((str(p) for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
+
+
+def futu_cli_auth_ready(executable):
+    try:
+        result = subprocess.run([executable,'auth','status','--format','json'],capture_output=True,
+                                text=True,encoding='utf-8',timeout=10)
+        payload = json.loads(result.stdout) if result.returncode==0 else {}
+    except (ValueError,subprocess.TimeoutExpired):
+        raise QuoteUnavailable('无法核验富途 CLI 授权状态；请在服务电脑运行 futu auth status --format json') from None
+    if not isinstance(payload,dict) or (payload.get('token') or {}).get('status') not in ('logged in','expired'):
+        raise QuoteUnavailable('富途 CLI 尚未完成 OAuth 授权；请在服务电脑运行 futu auth login')
+    # Discard the status payload. It can contain account metadata and is never cached or returned.
+
+
+def stock_futu_capital(meta):
+    executable = futu_cli_path()
+    if not executable:
+        raise QuoteUnavailable('未安装富途 CLI；资金异动需新版 futu CLI 及独立 OAuth 登录，网页 AppKey 不替代 CLI 授权')
+    futu_cli_auth_ready(executable)
+    symbol = research_symbol(meta)
+    command = [executable, 'unusual', 'capital-flows', symbol, '--time-range', '7', '--language-id', '0', '--format', 'json']
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', timeout=40)
+    except subprocess.TimeoutExpired:
+        raise QuoteUnavailable('富途资金异动请求超时（40 秒）') from None
+    if result.returncode:
+        output = (result.stderr or '').lower()
+        if any(cue in output for cue in ('unknown command', 'unknown flag')):
+            raise QuoteUnavailable('富途 CLI 版本不支持资金异动，请升级 CLI')
+        if any(cue in output for cue in ('auth', 'login', '401', '403', 'permission')):
+            raise QuoteUnavailable('富途 CLI 未登录或资金异动权限不足；请在服务电脑运行 futu auth login')
+        raise ValueError('富途 CLI 执行失败')
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict) or payload.get('retType') != 0 or payload.get('errCode') != 0 or payload.get('stock_symbol') != symbol:
+        raise ValueError('富途资金异动返回错误或证券不匹配')
+    raw_content = payload.get('content')
+    content = '\n'.join(clean_public_text(line, 2000) for line in raw_content.splitlines())[:12000] if isinstance(raw_content,str) else ''
+    if not content:
+        raise ValueError('富途资金异动未返回内容；不能视为没有异动')
+    today = dt.datetime.now(TZ).date()
+    return {'source':'富途资金异动', 'symbol':symbol, 'content':content,
+            'time_range':clean_public_text(payload.get('time_range'), 100),
+            'requested_range': {'start':(today-dt.timedelta(days=6)).isoformat(),'end':today.isoformat()},
+            'basis':'保留供应商资金分布/经纪商、资金流向与卖空原文；没有异动与未取得数据分别展示。'}
+
+
+def stock_item_relevant(meta, title, text=''):
+    content = title+' '+text
+    name = str(meta.get('name') or '').strip()
+    if len(name) >= 3 and name.casefold() in content.casefold():
+        return True
+    symbol = meta.get('symbol') or meta['code']
+    return bool(re.search(r'(?<![A-Za-z0-9])'+re.escape(symbol)+r'(?![A-Za-z0-9])',content,re.I))
+
+
+def stock_futu_news(meta):
+    keyword = meta['name'] if meta['market']=='CN' else meta.get('symbol') or meta['name']
+    rows = futu_public_items('news_search', keyword, 15, 30)
+    seen, items = set(), []
+    for row in rows:
+        key = re.sub(r'\W','',row['title']).casefold()
+        if key and key not in seen and stock_item_relevant(meta,row['title'],row['text']):
+            seen.add(key); items.append(row)
+    if not items:
+        raise ValueError('未返回近30日可核验关联的公司新闻')
+    return {'source':'富途新闻', 'items':items[:10], 'as_of':items[0]['published_at'],
+            'basis':'标题与摘要线索，不等于公告全文；同一事件的重复标题合并，观点由页面规则归纳。'}
+
+
+def stock_ifind_evidence(meta):
+    cn = meta['market']=='CN'
+    symbol = (meta.get('provider_symbol') or cn_provider_symbol(meta['code'])) if cn else meta['symbol']
+    target = (symbol[2:]+'.'+symbol[:2].upper()) if cn else ('港股 ' if meta['market']=='HK' else '美股 ')+symbol
+    subject = target+' '+meta['name']
+    service = 'stock' if cn else 'global_stock'
+    operations = [('业务', service, 'get_stock_info' if cn else 'global_stock_profile',
+                   '行业、主营业务、主要产品、主营构成、主营业务收入占比'),
+                  ('增长与现金', service, 'get_stock_financials' if cn else 'global_stock_financial',
+                   '营收同比、归母净利同比、毛利率、经营活动现金流净额、资本开支'),
+                  ('资本效率', service, 'get_stock_financials' if cn else 'global_stock_financial',
+                   'ROIC、研发资本化比例、股份支付费用')]
+    facts, notices, errors, seen = [], [], {}, set()
+    for label, server_type, tool, fields in operations:
+        try:
+            result = ifind_tool(server_type, tool, {'query':subject+' 最新已披露报告的'+fields+
+                '；仅此证券，返回证券代码、报告期、披露日期、原文链接、币种、金额单位和百分比单位的结构化表格。缺失留空，不估计。'})
+            for row in ifind_rows(result):
+                if not ifind_matches(row,symbol,meta['market']):
+                    continue
+                period = str(field_value(row,'period','report_date','报告期') or '')[:10]
+                try:
+                    if dt.date.fromisoformat(period)>dt.datetime.now(TZ).date():
+                        continue
+                except ValueError:
+                    continue
+                notice_date = str(field_value(row,'notice_date','披露日期') or '')[:10]
+                try:
+                    if dt.date.fromisoformat(notice_date)>dt.datetime.now(TZ).date():
+                        continue
+                except ValueError:
+                    notice_date = None
+                url = public_source_url(field_value(row,'url','source_url','原文链接'))
+                for field,(key,kind) in STOCK_RESEARCH_FIELDS.items():
+                    value = field_value(row,field,key)
+                    if value is None or isinstance(value,(dict,list)) or isinstance(value,bool):
+                        continue
+                    value = clean_public_text(str(value),1400 if kind=='text' else 120)
+                    if not value or value in ('--','—','None','null','暂无'):
+                        continue
+                    if kind!='text' and number(value.replace(',','').removesuffix('%')) is None:
+                        continue
+                    unit = '文本' if kind=='text' else str(field_value(row,field+'单位','unit','单位',
+                            '金额单位' if kind=='amount' else '百分比单位') or ('%' if '%' in value else ''))
+                    currency = field_value(row,'currency','币种')
+                    if kind=='amount' and (not unit or currency not in ('CNY','USD','HKD','人民币','美元','港元')):
+                        continue
+                    if kind=='percent' and unit not in ('%','百分比','百分点'):
+                        continue
+                    identity = (key,period,value)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    facts.append({'key':key,'label':field,'value':value,'unit':unit,'currency':currency,
+                                  'period':period,'notice_date':notice_date,'url':url,'source':'同花顺 iFinD','kind':kind})
+            if not any(f['label'] in fields for f in facts):
+                errors[label]='未返回代码、报告期和单位均可核验的结构化字段'
+        except QUOTE_READ_ERRORS as exc:
+            if isinstance(exc,QuoteUnavailable) and not facts:
+                raise
+            errors[label]=research_error(exc)
+    try:
+        today=dt.datetime.now(TZ).date()
+        result=ifind_tool('news','search_notice',{'query':subject+' 产品交付、订单收入、研发资本化、股份支付及解禁减持公告',
+            'time_start':(today-dt.timedelta(days=180)).isoformat(),'time_end':today.isoformat(),'size':8})
+        for row in ifind_rows(result):
+            title=clean_public_text(field_value(row,'title','标题','公告标题'),250)
+            link=public_source_url(field_value(row,'url','原文链接','链接'))
+            instant=public_time(field_value(row,'published_at','publish_time','发布时间','公告日期','日期'))
+            if title and link and instant and instant.date()>=today-dt.timedelta(days=180) and stock_item_relevant(meta,title):
+                notices.append({'title':title,'url':link,'published_at':instant.isoformat(),'source':'同花顺公告检索'})
+    except QUOTE_READ_ERRORS as exc:
+        errors['公告检索']=research_error(exc)
+    if not facts and not notices:
+        raise ValueError('同花顺未返回可核验的公司证据')
+    return {'source':'同花顺 iFinD','facts':facts[:60],'notices':notices[:8],'errors':errors,
+            'as_of':max([f['notice_date'] or f['period'] for f in facts]+[n['published_at'] for n in notices]),
+            'basis':'只展示返回的结构化字段；报告期、币种与单位逐项保留，不覆盖原财务口径。'}
+
+
+def enrich_stock_research(meta, record, previous=None, *, force=False):
+    if meta.get('type')!='stock':
+        return record
+    old=(previous or record).get('research_evidence') or {}
+    if old.get('symbol') != research_symbol(meta):
+        old={}
+    try:
+        age=(dt.datetime.now(TZ)-dt.datetime.fromisoformat(old['checked_at'])).total_seconds()
+    except (KeyError,ValueError,TypeError):
+        age=1e9
+    if not force and 0<=age<21600:
+        record['research_evidence']=old
+        return record
+    providers={}
+    operations={'pingan':stock_pingan_evidence,'futu_capital':stock_futu_capital,
+                'ifind':stock_ifind_evidence,'futu_news':stock_futu_news}
+    def load(entry):
+        key,operation=entry
+        started=time.monotonic()
+        checked=now()
+        try:
+            payload=operation(meta)
+            return key,{'status':'partial' if payload.get('errors') else 'ok','checked_at':checked,'data':payload,
+                        'elapsed_ms':round((time.monotonic()-started)*1000)}
+        except (OSError,ValueError,TypeError,KeyError,IndexError,AttributeError,subprocess.TimeoutExpired) as exc:
+            retained=(old.get('providers') or {}).get(key,{}).get('data')
+            return key,{'status':'retained' if retained else 'skipped' if isinstance(exc,QuoteUnavailable) else 'failed',
+                        'checked_at':checked,'data':retained,'error':research_error(exc),
+                        'data_checked_at':((old.get('providers') or {}).get(key) or {}).get('data_checked_at') or
+                            ((old.get('providers') or {}).get(key) or {}).get('checked_at') if retained else None,
+                        'elapsed_ms':round((time.monotonic()-started)*1000)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        providers.update(pool.map(load,operations.items()))
+    record['research_evidence']={'version':1,'symbol':research_symbol(meta),'checked_at':now(),'providers':providers}
+    return record
+
+
 def enrich_added_cn(meta, record):
     issues = {}
     operations = [('financials', lambda: load_financials(meta['code'], meta['name'], record['latest_quote'])),
@@ -3386,6 +3628,7 @@ class DataStore:
         self.commit_lock = threading.RLock()
         self.watch_operation_lock = threading.Lock()
         self.asset_jobs, self.job_versions = {}, {}
+        self.research_jobs = {}
         self.screen_jobs, self.screening_cache = {}, {}
         self.catalog = base_catalog()
         self.watchlist_revision = 0
@@ -3490,6 +3733,7 @@ class DataStore:
                 self.watchlist_revision += 1
                 self.job_versions[code] = secrets.token_hex(8)
                 self.asset_jobs.pop(code, None)
+                self.research_jobs.pop(code, None)
             self.save_registry()
 
     def start_asset(self, code):
@@ -3531,6 +3775,7 @@ class DataStore:
                     record['fundamentals'], record['financial_history'] = load_international_financials(meta)
                 except Exception as exc:
                     record.setdefault('research_errors', {})['financials'] = str(exc)[:200]
+            record = enrich_stock_research(meta, record, previous)
             with self.lock:
                 if self.job_versions.get(code) != version or not self.catalog[code].get('watch') and not self.catalog[code].get('benchmark'):
                     return
@@ -3544,6 +3789,46 @@ class DataStore:
             with self.lock:
                 if self.job_versions.get(code) == version:
                     self.asset_jobs[code] = {'status': 'error', 'error': str(exc)[:300], 'finished_at': now()}
+
+    def start_research(self, code):
+        with self.lock:
+            meta = self.catalog.get(code)
+            if not meta or meta.get('type') != 'stock' or not (meta.get('watch') or meta.get('benchmark')):
+                raise ValueError('请选择当前自选中的股票；ETF 请使用成分穿透研究')
+            if code not in self.snapshot.get('instruments', {}):
+                raise ValueError('请先取得该股票的一份有效行情快照，再补充独立研究')
+            if self.research_jobs.get(code, {}).get('status') == 'loading':
+                return False
+            job_id = secrets.token_hex(8)
+            self.research_jobs[code] = {'status':'loading','id':job_id,'started_at':now(),'stage':'读取公司研究证据'}
+        threading.Thread(target=self.refresh_research, args=(code,job_id), daemon=True).start()
+        return True
+
+    def refresh_research(self, code, job_id):
+        try:
+            with self.lock:
+                meta = dict(self.catalog[code])
+                previous = json.loads(json.dumps(self.snapshot['instruments'][code]))
+            result = enrich_stock_research(meta, {}, previous, force=True)['research_evidence']
+            # Merge research into the latest price record while holding the same commit lock.
+            with self.commit_lock:
+                with self.lock:
+                    current = self.catalog.get(code, {})
+                    if (self.research_jobs.get(code, {}).get('id') != job_id or not current.get('watch')):
+                        return
+                    records = dict(self.snapshot.get('instruments', {}))
+                    if code not in records:
+                        return
+                    records[code] = {**records[code], 'research_evidence':result}
+                    snapshot = {**self.snapshot,'instruments':records}
+                self.commit_snapshot(snapshot)
+            with self.lock:
+                states=[p['status'] for p in result['providers'].values()]
+                self.research_jobs[code] = {'status':'ready','finished_at':now(),
+                    'result':'ok' if all(x=='ok' for x in states) else 'partial' if any(x in ('ok','partial','retained') for x in states) else 'failed'}
+        except Exception as exc:
+            with self.lock:
+                self.research_jobs[code] = {'status':'error','finished_at':now(),'error':research_error(exc)}
 
     def start_screening(self, payload):
         source, codes, market = payload.get('source'), payload.get('codes'), payload.get('market', 'CN')
@@ -3762,7 +4047,7 @@ class DataStore:
                     if not live_error:
                         errors[code + ':live'] = str(exc)[:200]
                 old = previous.get('instruments', {}).get(code, {})
-                for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at']:
+                for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at', 'research_evidence']:
                     if key in old:
                         record[key] = old[key]
             # Publish a detached price snapshot before slower research requests finish.
@@ -3795,7 +4080,7 @@ class DataStore:
                 except (KeyError, ValueError, TypeError):
                     pass
                 if age < 21600 and not old.get('research_errors'):
-                    for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at']:
+                    for key in ['fundamentals', 'financial_history', 'announcements', 'etf', 'nav', 'flows', 'etf_flow', 'research_errors', 'research_fetched_at', 'research_evidence']:
                         if key in old:
                             rec[key] = old[key]
                 else:
@@ -3863,6 +4148,12 @@ class DataStore:
                         instruments[meta['code']]['fundamentals'], instruments[meta['code']]['financial_history'] = load_international_financials(meta)
                     except Exception as exc:
                         instruments[meta['code']].setdefault('research_errors', {})['financials'] = str(exc)[:180]
+            stock_meta = [m for m in active if m['type']=='stock' and m['code'] in instruments]
+            def supplement(meta):
+                code=meta['code']
+                enrich_stock_research(meta,instruments[code],previous.get('instruments',{}).get(code))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(supplement,stock_meta))
             has_external_update = False
             try:
                 prior_external = previous.get('external', [])
@@ -3931,6 +4222,9 @@ class DataStore:
                         if code not in enabled:
                             continue
                         old = records.get(code, {})
+                        old_research=old.get('research_evidence')
+                        if old_research and str(old_research.get('checked_at') or '')>str((record.get('research_evidence') or {}).get('checked_at') or ''):
+                            record={**record,'research_evidence':old_research}
                         if record.get('latest_quote', {}).get('quote_only') and (
                                 str(record['latest_quote'].get('timestamp') or '') <
                                 str(old.get('latest_quote', {}).get('timestamp') or '')):
@@ -3984,6 +4278,272 @@ class DataStore:
             warning = '行情已更新，但缓存无法写入；当前数据保留在内存，重启后需重新获取。' + str(failure)
             with self.lock:
                 self.state.update(cache_path=None, cache_warning=warning, cache_persisted=False)
+
+
+# Private, on-demand account reads. Never merge this response into DataStore or disk caches.
+ACCOUNT_READ_LIMIT = threading.BoundedSemaphore(2)
+ACCOUNT_MARKETS = {1:('HK','港股','Asia/Hong_Kong'),2:('US','美股','America/New_York'),
+                   4:('HKCC','沪深股通','Asia/Shanghai'),6:('SG','新加坡','Asia/Singapore'),
+                   8:('AU','澳大利亚','Australia/Sydney'),11:('MY','马来西亚','Asia/Kuala_Lumpur'),
+                   12:('CA','加拿大','America/Toronto'),15:('JP','日本','Asia/Tokyo'),
+                   18:('KR','韩国','Asia/Seoul')}
+PENDING_ACCOUNT_ORDER_STATUSES = frozenset(('WAITING_SUBMIT','SUBMITTING','SUBMITTED','FILLED_PART',
+                                           'CANCELLING_PART','CANCELLING_ALL'))
+ACCOUNT_CURRENCIES = frozenset(('HKD','USD','CNY','SGD','JPY','AUD','CAD','MYR','KRW'))
+
+
+class AccountReadError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def account_read_error(output):
+    text = str(output).upper()
+    if 'PERMISSION_DENIED' in text or '403' in text:
+        return AccountReadError('permission_denied','富途拒绝账户读取权限（PERMISSION_DENIED / 403）；请核对授权账户及读取权限，行情 AppKey 通过测试不代表账户有权限')
+    if any(key in text for key in ('UNAUTHORIZED','NOT LOGGED IN','401','TOKEN EXPIRED','LOGIN REQUIRED')):
+        return AccountReadError('login_required','富途 CLI 账户会话不可用，请在运行服务的电脑执行 futu auth login')
+    if 'UNKNOWN COMMAND' in text or 'UNKNOWN FLAG' in text:
+        return AccountReadError('cli_outdated','当前富途 CLI 不支持账户读取命令，请更新官方 CLI')
+    return AccountReadError('provider_failed','富途账户读取失败，请检查 CLI 连接与账户状态后重试；原始命令输出不回传页面')
+
+
+def futu_account_command(executable, action, *, account=None, currency=None, market=None):
+    # Fixed read-only commands. No user-supplied command, flag or executable is accepted.
+    routes={'version':['version'],'auth':['auth','status'],'list':['account','list'],
+            'funds':['account','funds'],'positions':['position'],'orders':['order','list']}
+    if action not in routes:
+        raise AccountReadError('invalid_action','不支持的账户读取操作')
+    args=[executable,*routes[action]]
+    if action in ('funds','positions','orders'):
+        if not isinstance(account,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',account):
+            raise AccountReadError('invalid_account','账户标识无效')
+        args+=['--account',account]
+    if action=='funds':
+        if currency not in ACCOUNT_CURRENCIES:
+            raise AccountReadError('invalid_currency','不支持的资金展示币种')
+        args+=['--currency',currency]
+    if action=='orders':
+        if market not in {entry[0] for entry in ACCOUNT_MARKETS.values()}:
+            raise AccountReadError('invalid_market','不支持的订单市场')
+        args+=['--market',market]
+    args+=['--format','json','--source','skill']
+    try:
+        result=subprocess.run(args,capture_output=True,text=True,encoding='utf-8',timeout=35)
+    except subprocess.TimeoutExpired:
+        raise AccountReadError('timeout','富途账户读取超时（35 秒），请稍后重试') from None
+    except OSError:
+        raise AccountReadError('cli_unavailable','无法运行富途 CLI，请检查本机安装') from None
+    if result.returncode:
+        raise account_read_error(result.stderr or result.stdout)
+    if action=='version':
+        return None
+    try:
+        return json.loads(result.stdout)
+    except (ValueError,TypeError):
+        raise AccountReadError('invalid_response','富途账户接口未返回有效 JSON') from None
+
+
+def futu_account_connection():
+    executable=futu_cli_path()
+    if not executable:
+        raise AccountReadError('cli_missing','此电脑尚未安装富途 CLI。请按账户页指引安装，并运行 futu auth login 完成账户授权')
+    futu_account_command(executable,'version')
+    auth=futu_account_command(executable,'auth')
+    if not isinstance(auth,dict) or not isinstance(auth.get('token'),dict) or auth['token'].get('status')!='logged in':
+        raise AccountReadError('login_required','富途 CLI 尚未登录或会话已过期，请在运行服务的电脑执行 futu auth login')
+    # Discard auth/account metadata; only business reads below are returned.
+    return executable
+
+
+def account_decimal(value):
+    from decimal import Decimal, InvalidOperation
+    if isinstance(value,bool) or value is None:
+        return None
+    try:
+        number=Decimal(str(value))
+        return format(number,'f') if number.is_finite() else None
+    except (InvalidOperation,ValueError):
+        return None
+
+
+def normalize_futu_accounts(raw):
+    if raw is None:
+        raw=[]  # Official CLI prints a nil result slice as JSON null on a successful read.
+    if not isinstance(raw,list) or any(not isinstance(r,dict) for r in raw):
+        raise AccountReadError('invalid_response','富途账户清单格式无效')
+    output,seen=[],set()
+    for row in raw:
+        account=str(row.get('account_id') or '')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',account) or account in seen:
+            continue
+        seen.add(account)
+        markets=row.get('enable_market') or []
+        markets=[v for v in markets if type(v) is int] if isinstance(markets,list) else []
+        output.append({'account_id':account,'display_id':'••••'+account[-4:],
+            'type':clean_public_text(row.get('acc_type'),60),'name':clean_public_text(row.get('name'),100),
+            'security_firm':clean_public_text(row.get('security_firm'),80),'markets':markets,
+            'market_names':[ACCOUNT_MARKETS[v][1] if v in ACCOUNT_MARKETS else '未接入市场 '+str(v) for v in markets]})
+    if raw and not output:
+        raise AccountReadError('invalid_response','富途未返回可核验的账户标识')
+    return output
+
+
+def normalize_account_funds(raw,currency):
+    if not isinstance(raw,dict) or raw.get('currency')!=currency:
+        raise AccountReadError('invalid_response','资金响应缺少同一展示币种，未采用该数据')
+    fields=('available_funds','cash','frozen_cash','power','max_withdrawal','total_assets','market_val')
+    metrics={key:account_decimal(raw.get(key)) for key in fields}
+    if not any(value is not None for value in metrics.values()):
+        raise AccountReadError('invalid_response','富途未返回可用资金字段')
+    return {'currency':currency,**metrics}
+
+
+def normalize_account_positions(raw):
+    if raw is None:
+        raw=[]
+    if not isinstance(raw,list) or any(not isinstance(r,dict) for r in raw):
+        raise AccountReadError('invalid_response','富途持仓响应格式无效')
+    output,skipped=[],0
+    for row in raw:
+        code=row.get('code')
+        qty=account_decimal(row.get('qty'))
+        if not isinstance(code,str) or not re.fullmatch(r'[A-Z]{2,8}\.[A-Za-z0-9_.-]{1,80}',code) or qty is None:
+            skipped+=1;continue
+        from decimal import Decimal
+        if Decimal(qty)==0:
+            continue
+        item={'code':code,'name':clean_public_text(row.get('stock_name'),150),
+              'currency':str(row.get('currency') or '未返回')[:10],
+              'side':clean_public_text(row.get('position_side'),30),'qty':qty}
+        for key in ('can_sell_qty','nominal_price','market_val','today_pl_val'):
+            item[key]=account_decimal(row.get(key))
+        for key in ('cost_price','pl_val','pl_ratio'):
+            item[key]=account_decimal(row.get(key)) if row.get(key+'_valid') is True else None
+        output.append(item)
+    return {'items':output,'skipped':skipped}
+
+
+def account_order_time(value):
+    # Official create_time can use seconds, milliseconds, microseconds or nanoseconds.
+    try:
+        if isinstance(value,bool) or value is None:
+            return None
+        if isinstance(value,(int,float)) or isinstance(value,str) and re.fullmatch(r'\d{10,19}',value):
+            from decimal import Decimal
+            stamp=Decimal(str(value))
+            if not stamp.is_finite() or stamp<=0:
+                return None
+            while stamp>=10**11:
+                stamp/=1000
+            whole=int(stamp)
+            return dt.datetime.fromtimestamp(whole,dt.timezone.utc)+dt.timedelta(microseconds=int((stamp-whole)*1000000))
+        instant=dt.datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        return instant if instant.tzinfo else None  # Never guess a timezone for a naive timestamp.
+    except (ValueError,TypeError,OSError,OverflowError):
+        return None
+
+
+def account_market_day(instant,market):
+    zone=next(entry[2] for entry in ACCOUNT_MARKETS.values() if entry[0]==market)
+    if market in ('HK','US','HKCC','CA'):
+        return quote_day(instant,'America/New_York' if market=='CA' else zone).isoformat()
+    if market in ('SG','MY'):
+        return instant.astimezone(TZ).date().isoformat()
+    if market in ('JP','KR'):
+        return instant.astimezone(dt.timezone(dt.timedelta(hours=9))).date().isoformat()
+    try:
+        from zoneinfo import ZoneInfo
+        return instant.astimezone(ZoneInfo(zone)).date().isoformat()
+    except (ImportError,KeyError):
+        raise AccountReadError('timezone_unavailable','此电脑缺少澳大利亚时区信息，无法判断当日订单；可安装 Python tzdata') from None
+
+
+def normalize_pending_orders(raw,market,*,current=None):
+    current=current or dt.datetime.now(dt.timezone.utc)
+    day=account_market_day(current,market)
+    if raw is None:
+        raw=[]
+    if not isinstance(raw,list) or any(not isinstance(r,dict) for r in raw):
+        raise AccountReadError('invalid_response','富途当前订单响应格式无效')
+    items,unclassified,seen=[],0,set()
+    for row in raw:
+        status=row.get('status') or row.get('order_status')
+        if status not in PENDING_ACCOUNT_ORDER_STATUSES:
+            if status not in ('FILLED_ALL','CANCELLED_PART','CANCELLED_ALL','FAILED','DISABLED','DELETED'):
+                unclassified+=1
+            continue
+        instant=account_order_time(row.get('create_time'))
+        if instant is None or instant>current:
+            unclassified+=1;continue
+        if account_market_day(instant,market)!=day:
+            continue
+        symbol=row.get('symbol') or row.get('code')
+        order=str(row.get('order_id') or '')
+        qty=account_decimal(row.get('qty'))
+        filled=account_decimal(row.get('filled_qty',row.get('dealt_qty')))
+        if (not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',order) or not isinstance(symbol,str)
+                or not re.fullmatch(r'[A-Z]{2,8}\.[A-Za-z0-9_.-]{1,80}',symbol) or qty is None):
+            unclassified+=1;continue
+        from decimal import Decimal
+        if Decimal(qty)<=0 or filled is not None and (Decimal(filled)<0 or Decimal(filled)>=Decimal(qty)):
+            continue
+        prefix=symbol.split('.')[0]
+        if prefix not in ({'SH','SZ','BJ','HKCC'} if market=='HKCC' else {market}):
+            unclassified+=1;continue
+        identity=(market,order)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        items.append({'order_id':order,'symbol':symbol,'name':clean_public_text(row.get('stock_name'),150),
+            'market':market,'side':clean_public_text(row.get('side') or row.get('trd_side'),30),
+            'type':clean_public_text(row.get('type') or row.get('order_type'),40),'status':status,
+            'price':account_decimal(row.get('price')),'qty':qty,'filled_qty':filled,
+            'remaining_qty':format(Decimal(qty)-Decimal(filled),'f') if filled is not None else None,
+            'created_at':instant.isoformat(),'local_date':day})
+    return {'items':sorted(items,key=lambda r:r['created_at'],reverse=True),'unclassified':unclassified,
+            'market':market,'local_date':day,'timezone':next(e[2] for e in ACCOUNT_MARKETS.values() if e[0]==market)}
+
+
+def read_futu_account(payload):
+    action=payload.get('action','list')
+    if action not in ('list','snapshot'):
+        raise AccountReadError('invalid_action','仅支持账户清单与账户概览读取')
+    if not ACCOUNT_READ_LIMIT.acquire(blocking=False):
+        raise AccountReadError('busy','账户读取正在进行，请稍后重试')
+    try:
+        executable=futu_account_connection()
+        accounts=normalize_futu_accounts(futu_account_command(executable,'list'))
+        if action=='list':
+            return {'accounts':accounts,'checked_at':now(),'source':'富途官方 CLI / OAuth'}
+        account=payload.get('account_id')
+        selected=next((a for a in accounts if a['account_id']==account),None)
+        if selected is None:
+            raise AccountReadError('invalid_account','该账户不在当前富途授权清单中，请重新读取账户')
+        currency=payload.get('currency','HKD')
+        if currency not in ACCOUNT_CURRENCIES:
+            raise AccountReadError('invalid_currency','不支持的资金展示币种')
+        sections={}
+        def load(key,action,**kwargs):
+            started=now()
+            try:
+                raw=futu_account_command(executable,action,account=account,**kwargs)
+                value=normalize_account_funds(raw,currency) if action=='funds' else normalize_account_positions(raw) if action=='positions' else normalize_pending_orders(raw,kwargs['market'])
+                return key,{'ok':True,'data':value,'checked_at':now(),'requested_at':started}
+            except AccountReadError as exc:
+                return key,{'ok':False,'error':str(exc),'code':exc.code,'checked_at':now()}
+        operations=[('funds','funds',{'currency':currency}),('positions','positions',{})]
+        operations += [('orders:'+ACCOUNT_MARKETS[v][0],'orders',{'market':ACCOUNT_MARKETS[v][0]}) for v in dict.fromkeys(selected['markets']) if v in ACCOUNT_MARKETS]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            tasks=[pool.submit(load,key,operation,**kwargs) for key,operation,kwargs in operations]
+            sections.update(task.result() for task in tasks)
+        unsupported=[v for v in selected['markets'] if v not in ACCOUNT_MARKETS]
+        return {'account':selected,'currency':currency,'sections':sections,'checked_at':now(),
+                'source':'富途官方 CLI / OAuth','order_date_basis':'按各市场交易所当地日期筛选今日新建、仍在途或部分成交的订单',
+                'unsupported_order_markets':unsupported,'order_markets_missing':not bool(selected['markets'])}
+    finally:
+        ACCOUNT_READ_LIMIT.release()
 
 
 class LocalHTTPServer(ThreadingHTTPServer):
@@ -4068,7 +4628,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = {**self.server.store.state, 'coverage': len(self.server.store.snapshot['instruments']), 'total': sum(bool(m.get('watch') or m.get('benchmark')) for m in self.server.store.catalog.values()),
                           'as_of': self.server.store.snapshot.get('as_of'),
                           'closed_as_of': self.server.store.snapshot.get('closed_as_of'),
-                          'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server', 'data_revision': self.server.store.data_revision, 'watchlist_revision': self.server.store.watchlist_revision, 'asset_jobs': dict(self.server.store.asset_jobs)}
+                          'fetched_at': self.server.store.snapshot.get('fetched_at'), 'environment': 'local-server', 'data_revision': self.server.store.data_revision, 'watchlist_revision': self.server.store.watchlist_revision, 'asset_jobs': dict(self.server.store.asset_jobs), 'research_jobs': dict(self.server.store.research_jobs)}
                 result['quote_attempts'] = list(result.get('quote_attempts', []))
             result['market_keys'] = self.market_key_statuses()
             result['ifind'] = result['market_keys']['ifind']
@@ -4083,21 +4643,23 @@ class Handler(BaseHTTPRequestHandler):
         if name not in ['index.html', 'styles.css', 'workbench.css', 'data.js', 'engine.js', 'app.js',
                         'views.js', 'research-views.js', 'strategy-views.js', 'local-connector.js', 'bootstrap.js',
                         'lightweight-charts.js', 'lightweight-charts.LICENSE.txt', 'interactive-chart.js', 'evidence-views.js',
-                        'user-state.js', 'record-ui.js', 'themes.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css', 'wyckoff-engine.js', 'wyckoff-views.js', 'wyckoff.css']:
+                        'user-state.js', 'record-ui.js', 'themes.css', 'watchlist-manager.js', 'watchlist-manager.css', 'factor-screening.js', 'factor-screening.css', 'risk-engine.js', 'risk-views.js', 'risk.css', 'market-cards.js', 'market-cards.css', 'wyckoff-engine.js', 'wyckoff-views.js', 'wyckoff.css', 'stock-research.js', 'stock-research.css', 'futu-account.js', 'futu-account.css', 'install_futu_cli.py']:
             return self.send({'error': 'Not found'}, status=404)
         embedded = globals().get('EMBEDDED_ASSETS', {})
         if name in embedded:
             text = embedded[name]
         else:
-            text = (ROOT / 'dist' / name).read_text(encoding='utf-8')
+            text = (ROOT / ('tools' if name == 'install_futu_cli.py' else 'dist') / name).read_text(encoding='utf-8')
         if name == 'index.html':
             text = text.replace('</head>', '<script>window.RISKLENS_LOCAL=true;window.RISKLENS_TOKEN=' + json.dumps(TOKEN) + ';</script></head>')
+        if name == 'install_futu_cli.py':
+            return self.send(text.encode('utf-8'), 'application/octet-stream')
         kind = 'text/html' if name.endswith('.html') else 'text/css' if name.endswith('.css') else 'text/plain' if name.endswith('.txt') else 'application/javascript'
         self.send(text.encode(), kind + '; charset=utf-8')
 
     def do_POST(self):
         key_provider = MARKET_KEY_TEST_PATHS.get(self.path)
-        if not key_provider and self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start'):
+        if not key_provider and self.path not in ('/api/refresh', '/api/watchlist/add', '/api/watchlist/remove', '/api/watchlist/refresh', '/api/screening/start', '/api/research/refresh', '/api/account/read'):
             return self.send({'error': 'Not found'}, status=404)
         if not self.is_page_request():
             return self.send({'error': '仅允许当前页面发起操作'}, status=403)
@@ -4121,6 +4683,14 @@ class Handler(BaseHTTPRequestHandler):
                 result['market_keys'] = self.market_key_statuses()
                 return self.send(result)
             store = self.server.store
+            if self.path == '/api/account/read':
+                try:
+                    return self.send(read_futu_account(payload))
+                except AccountReadError as exc:
+                    return self.send({'error':str(exc),'code':exc.code},status=409 if exc.code=='busy' else 400 if exc.code.startswith('invalid_') else 502)
+            if self.path == '/api/research/refresh':
+                started = store.start_research(payload.get('code'))
+                return self.send({'started':started},status=202 if started else 200)
             if self.path == '/api/screening/start':
                 return self.send({'id': store.start_screening(payload)}, status=202)
             if self.path == '/api/watchlist/add':
@@ -4144,7 +4714,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     global PROXY_MODE
-    parser = argparse.ArgumentParser(description='观澜本地数据环境（只读行情，不连接券商）')
+    parser = argparse.ArgumentParser(description='观澜本地研究环境（行情、公司研究与富途账户查询）')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--cache', default=str(Path.home() / '.risklens' / 'market-cache.json'))

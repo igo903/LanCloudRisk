@@ -1,4 +1,4 @@
-function render(){resolveResearchRoute();destroyResearchChart();renderShell();const pages={overview,market,watchlist,research,sentiment,valuation,factors,backtest,review,data:dataCenter};$('#main').innerHTML=`<div class="loading-free">${banner()}${researchRouteUnavailable()?unavailableResearchPage():(pages[state.page]||overview)()}</div>`;mountResearchChart()}
+function render(){resolveResearchRoute();destroyResearchChart();renderShell();const pages={overview,market,watchlist,account:futuAccountPage,research,sentiment,valuation,factors,backtest,review,data:dataCenter};$('#main').innerHTML=`<div class="loading-free">${banner()}${researchRouteUnavailable()?unavailableResearchPage():(pages[state.page]||overview)()}</div>`;mountResearchChart()}
 $('#global-search').addEventListener('input',e=>{state.query=e.target.value;state.filter='all';go('watchlist')});
 $('#dialog').addEventListener('click',e=>{if(e.target===$('#dialog')){const r=$('#dialog').getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)$('#dialog').close()}});
 applyHashRoute();

@@ -1,4 +1,4 @@
-const NAV=[['overview','风险总览','home'],['market','市场与行业','chart'],['watchlist','我的自选','folder'],['research','个股七维分析','nodes'],['sentiment','市场情绪偏离','clock'],['valuation','估值与基本面','shield'],['factors','多因子筛选','settings'],['backtest','笑哭脸回测','smile'],['review','研究复盘','plan'],['data','数据与方法','folder']];
+const NAV=[['overview','风险总览','home'],['market','市场与行业','chart'],['watchlist','我的自选','folder'],['account','账户','wallet'],['research','个股七维分析','nodes'],['sentiment','市场情绪偏离','clock'],['valuation','估值与基本面','shield'],['factors','多因子筛选','settings'],['backtest','笑哭脸回测','smile'],['review','研究复盘','plan'],['data','数据与方法','folder']];
 const E=RiskEngine,byCode=c=>CATALOG.find(a=>a.code===c);
 let uploaded=null,mode='demo';try{const s=localStorage.getItem('risklens-v2-snapshot');if(s)uploaded=E.validateSnapshot(JSON.parse(s));mode=localStorage.getItem('risklens-v2-mode')||'demo'}catch{}
 const state={page:'overview',code:'002281',dimension:0,query:'',filter:'all',market:'bench',metric:'ret20',btTab:'equity',weights:[1,1,1,1,1,1]};
