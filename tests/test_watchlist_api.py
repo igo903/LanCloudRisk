@@ -94,7 +94,7 @@ class APITests(unittest.TestCase):
                 self.assertEqual(request('/api/watchlist/remove',[])[0],400)
                 self.assertEqual(request('/local/server.py')[0],404)
                 self.assertEqual(request('/.git/config')[0],404)
-                self.assertEqual(request('/api/status')[1]['total'],13)
+                self.assertEqual(request('/api/status')[1]['total'],18)
                 self.assertEqual(request('/api/refresh',token=False,method='POST')[1]['code'],'stale_session')
                 self.assertEqual(request('/api/session',origin='https://preview.example',fetch_site='same-origin'),(200,{'token':app.TOKEN}))
                 self.assertEqual(request('/api/session',origin='https://evil.example',fetch_site='cross-site')[0],403)

@@ -102,19 +102,19 @@ function sortedRiskRows(rows,table,sort=state.riskSorts?.[table]){
 }
 function riskTableHeader(table,key,label,hint=''){
  if(!key)return `<th scope="col">${esc(label)}</th>`;
- const active=state.riskSorts?.[table]?.key===key,direction=active?state.riskSorts[table].direction:null,next=direction==='asc'?'降序':'升序';
- return `<th scope="col" aria-sort="${active?(direction==='asc'?'ascending':'descending'):'none'}"><button class="risk-sort-button ${active?'active':''}" data-risk-sort="${table}-${key}" onclick="toggleRiskSort('${table}','${key}')" aria-label="${esc(label)}，点击${next}排列" title="${esc(hint||label)}；点击${next}">${esc(label)}<span aria-hidden="true">${direction==='asc'?'↑':direction==='desc'?'↓':'↕'}</span></button></th>`;
+ const active=state.riskSorts?.[table]?.key===key,direction=active?state.riskSorts[table].direction:null,next=direction==='asc'?'降序':direction==='desc'?'恢复默认排序':'升序';
+ return `<th scope="col" aria-sort="${active?(direction==='asc'?'ascending':'descending'):'none'}"><button class="risk-sort-button ${active?'active':''}" data-risk-sort="${table}-${key}" onclick="toggleRiskSort('${table}','${key}')" aria-label="${esc(label)}，点击${next}" title="${esc(hint||label)}；点击${next}">${esc(label)}<span aria-hidden="true">${direction==='asc'?'↑':direction==='desc'?'↓':'↕'}</span></button></th>`;
 }
 function toggleRiskSort(table,key){
  if(!RISK_TABLE_COLUMNS[table]?.includes(key))return;
- const old=state.riskSorts?.[table];state.riskSorts={...state.riskSorts,[table]:{key,direction:old?.key===key&&old.direction==='asc'?'desc':'asc'}};
+ const old=state.riskSorts?.[table];state.riskSorts={...state.riskSorts,[table]:old?.key===key&&old.direction==='desc'?null:{key,direction:old?.key===key&&old.direction==='asc'?'desc':'asc'}};
  const left=document.querySelector(`[data-risk-table="${table}"]`)?.scrollLeft||0,x=window.scrollX,y=window.scrollY;
  render();const wrap=document.querySelector(`[data-risk-table="${table}"]`);if(wrap)wrap.scrollLeft=left;
  window.scrollTo(x,y);document.querySelector(`[data-risk-sort="${table}-${key}"]`)?.focus({preventScroll:true});
 }
 function riskDataTable(table,label,columns,rows,extraClass=''){
  const sorted=sortedRiskRows(rows,table);
- return `<div class="table-wrap risk-data-wrap" data-risk-table="${table}"><table class="risk-data-table ${extraClass}" aria-label="${esc(label)}"><thead><tr>${columns.map(([key,title,hint])=>riskTableHeader(table,key,title,hint)).join('')}</tr></thead><tbody>${sorted.map(row=>`<tr>${row.cells.map(cell=>`<td>${cell}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${columns.length}" class="empty">暂无可用标的，缺失数据不会补造。</td></tr>`}</tbody></table></div><p class="risk-sort-note">点击表头切换升序 / 降序；缺失值始终置后，同值保持原顺序。${table==='flows'?'默认展示最近10个资金记录日期；当日净流入与原超大单+大单净额列同口径。累计净流入为超大单+大单净额，截至各行日期并包含当日。近N日按N条去重后的日频记录计算；不足N条或窗口内缺失显示—，零值正常计入。节假日不插值；来源未返回的日期无法据此确认。金额按标的原币种展示，不代表机构身份或ETF净申购。':table==='researchPool'?'经营现金按各自报告币种的原始金额排序，未换汇；报告期与累计/年度口径不同，请逐项核对。':table.startsWith('market')?'ETF为价格代理，不含分红再投资；盘中末根会随行情刷新变化。':'关注分覆盖不足60%不展示、不参与数值排名。价格按原单位数值排序，不换汇。外围变化列按展示数值排序，bp与%不可视作同口径收益排名。'}</p>`;
+ return `<div class="table-wrap risk-data-wrap" data-risk-table="${table}"><table class="risk-data-table ${extraClass}" aria-label="${esc(label)}"><thead><tr>${columns.map(([key,title,hint])=>riskTableHeader(table,key,title,hint)).join('')}</tr></thead><tbody>${sorted.map(row=>`<tr>${row.cells.map(cell=>`<td>${cell}</td>`).join('')}</tr>`).join('')||`<tr><td colspan="${columns.length}" class="empty">暂无可用标的，缺失数据不会补造。</td></tr>`}</tbody></table></div><p class="risk-sort-note">同一表头依次点击：升序 → 降序 → 默认排序；排序时缺失值置后，同值保持原顺序。${table==='flows'?'默认展示最近10个资金记录日期；当日净流入与原超大单+大单净额列同口径。累计净流入为超大单+大单净额，截至各行日期并包含当日。近N日按N条去重后的日频记录计算；不足N条或窗口内缺失显示—，零值正常计入。节假日不插值；来源未返回的日期无法据此确认。金额按标的原币种展示，不代表机构身份或ETF净申购。':table==='researchPool'?'经营现金按各自报告币种的原始金额排序，未换汇；报告期与累计/年度口径不同，请逐项核对。':table.startsWith('market')?'ETF为价格代理，不含分红再投资；盘中末根会随行情刷新变化。':'关注分覆盖不足60%不展示、不参与数值排名。价格按原单位数值排序，不换汇。外围变化列按展示数值排序，bp与%不可视作同口径收益排名。'}</p>`;
 }
 function riskReturnCell(x,n){const r=x.returns?.[String(n)];return `<span class="num ${cls(r?.value)}">${E.valid(r?.value)?(r.value>0?'+':'')+num(r.value)+(r.unit==='bp'?' bp':'%'):'—'}</span>`}
 function riskDateCell(x){return `${esc(x.history_as_of||x.timestamp||'未返回')}<small class="table-sub">${esc(x.timezone||'日频')}${x.provisional?' · 盘中快照':''}</small>${x.url?sourceLink(x.url,'来源'):''}`}

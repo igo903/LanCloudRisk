@@ -41,6 +41,9 @@ ASSETS = [
     ('510300', '沪深300ETF华泰柏瑞', None), ('159338', '中证A500ETF国泰', None),
     ('510500', '中证500ETF南方', None), ('512100', '中证1000ETF南方', None),
     ('159915', '创业板ETF易方达', None),
+    ('510050', '上证50ETF华夏', None), ('159919', '沪深300ETF嘉实', None),
+    ('588000', '科创50ETF华夏', None), ('159901', '深证100ETF易方达', None),
+    ('159922', '中证500ETF嘉实', None),
 ]
 SYMBOLS = {c: ('sh' if c.startswith(('5', '6')) else 'sz') + c for c, _, _ in ASSETS}
 SECTOR_ASSETS = [('512480', '半导体ETF国联安', None), ('515880', '通信ETF国泰', None)]
@@ -2436,8 +2439,9 @@ def load_geopolitics(instruments=None, catalog=None):
 
 # Market-qualified IDs prevent collisions such as HK.00700 versus US.00700.
 BENCHMARK_CODES = {'510300', '159338', '510500', '512100', '159915', '588080'}
-BASE_WATCH_CODES = {'002281', '601869', '688825', '688981', '300033', '300390', '515980'} | BENCHMARK_CODES
-WATCHLIST_DEFAULTS_VERSION = 1
+OPTION_UNDERLYING_CODES = ('510050', '510300', '159919', '510500', '588000', '588080', '159901', '159915', '159922')
+BASE_WATCH_CODES = {'002281', '601869', '688825', '688981', '300033', '300390', '515980'} | BENCHMARK_CODES | set(OPTION_UNDERLYING_CODES)
+WATCHLIST_DEFAULTS_VERSION = 2
 RISK_WEIGHTS = {'DXY': 6, 'CNH': 5, 'US10Y': 4, 'DJI': 2, 'IXIC': 8, 'N225': 2, 'KOSPI': 2,
                 'SOX': 12, 'usSOXX': 10, 'usQQQ': 14, 'hkHSTECH': 5, 'A50': 3, 'GOLD': 2, 'SILVER': 1, 'BTC': 4}
 SEARCH_CACHE, SEARCH_LOCK = {}, threading.Lock()
@@ -3653,6 +3657,7 @@ class DataStore:
             self.state['cache_warning'] = '已使用备用缓存目录：' + str(self.cache.parent)
 
         cached_catalog = self.snapshot.get('catalog')
+        restored_watch_codes = set()
         if isinstance(cached_catalog, list) and len(cached_catalog) <= 200:
             for item in cached_catalog:
                 try:
@@ -3666,6 +3671,8 @@ class DataStore:
                         continue
                     safe.update(watch=item.get('watch') is True, benchmark=item['code'] in BENCHMARK_CODES if market == 'CN' else False)
                     self.catalog[item['code']] = safe
+                    if safe['watch']:
+                        restored_watch_codes.add(item['code'])
                     if market == 'CN':
                         SYMBOLS[item['code']] = safe['provider_symbol']
                 except (KeyError, TypeError, ValueError):
@@ -3676,11 +3683,17 @@ class DataStore:
         cached = self.snapshot.get('screening_cache')
         if isinstance(cached, dict):
             self.screening_cache = {k:v for k,v in list(cached.items())[-200:] if isinstance(v, dict)}
-        if self.registry_activated and not self.snapshot.get('watchlist_defaults_version'):
-            missing = BENCHMARK_CODES - {code for code in BENCHMARK_CODES if self.catalog[code]['watch']}
-            for code in missing:
-                self.catalog[code]['watch'] = True
-            if missing:
+        version = self.snapshot.get('watchlist_defaults_version')
+        version = version if type(version) is int and version >= 0 else 0
+        if self.registry_activated and version < WATCHLIST_DEFAULTS_VERSION:
+            if version < 1:
+                for code in BENCHMARK_CODES:
+                    self.catalog[code]['watch'] = True
+            if version < 2:
+                for code in OPTION_UNDERLYING_CODES:
+                    self.catalog[code]['watch'] = True
+            active = {code for code, meta in self.catalog.items() if meta.get('watch')}
+            if active != restored_watch_codes:
                 self.watchlist_revision += 1
             self.commit_snapshot(self.snapshot)
 

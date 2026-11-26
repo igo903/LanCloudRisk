@@ -23,7 +23,22 @@ test('sort state and accessible headers are independent for each table',()=>{
  vm.runInContext("toggleRiskSort('external','weight');toggleRiskSort('external','weight');toggleRiskSort('domestic','price')",context);
  assert.equal(state.riskSorts.external.direction,'desc');assert.equal(state.riskSorts.domestic.direction,'asc');
  assert.match(vm.runInContext("riskTableHeader('external','weight','权重')",context),/aria-sort="descending"/);assert.match(vm.runInContext("riskTableHeader('domestic','price','价格')",context),/点击降序/);
+ assert.match(vm.runInContext("riskTableHeader('external','weight','权重')",context),/点击恢复默认排序/);
+ vm.runInContext("toggleRiskSort('external','weight')",context);assert.equal(state.riskSorts.external,null);assert.equal(state.riskSorts.domestic.direction,'asc');
+ assert.match(vm.runInContext("riskTableHeader('external','weight','权重')",context),/aria-sort="none"/);
+ const rows=[{id:'missing',values:{weight:null}},{id:'high',values:{weight:10}},{id:'low',values:{weight:1}}];
+ assert.deepEqual(ids(sorted(rows,'external')),['missing','high','low']);
  const before=JSON.stringify(state);vm.runInContext("toggleRiskSort('external','__proto__');setRiskLayout('bad','table')",context);assert.equal(JSON.stringify(state),before);
+});
+test('every sortable column in every risk table supports the full three-click cycle',()=>{
+ const columns=vm.runInContext('RISK_TABLE_COLUMNS',context);
+ for(const [table,keys] of Object.entries(columns))for(const key of keys){
+  state.riskSorts[table]=null;context.tableUnderTest=table;context.keyUnderTest=key;
+  for(const expected of ['asc','desc',null]){
+   vm.runInContext('toggleRiskSort(tableUnderTest,keyUnderTest)',context);
+   assert.equal(state.riskSorts[table]?.direction??null,expected,table+':'+key);
+  }
+ }
 });
 test('all supported table headers expose sorting while interpretation columns remain plain',()=>{
  const rows=[{id:'a',values:{risk:20},cells:['样本','20']}];const html=vm.runInContext('riskDataTable',context)('watch','自选风险表',[['name','自选标的'],['risk','综合关注分']],rows);assert.match(html,/aria-label="自选风险表"/);assert.match(html,/data-risk-sort="watch-risk"/);assert.match(vm.runInContext("riskTableHeader('watch',null,'解读')",context),/^<th scope="col">解读<\/th>$/);

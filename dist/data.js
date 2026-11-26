@@ -20,7 +20,13 @@ const CATALOG=[
  {code:'159338',name:'中证A500ETF国泰',shortName:'A500ETF',type:'etf',industry:'全市场宽基',watch:true,benchmark:true,base:1.12,topic:'中证A500',manager:'国泰',source:IDENTITY_SOURCES.a500},
  {code:'510500',name:'中证500ETF南方',shortName:'中证500ETF',type:'etf',industry:'中盘宽基',watch:true,benchmark:true,base:6.8,topic:'中证500',manager:'南方'},
  {code:'512100',name:'中证1000ETF南方',shortName:'中证1000ETF',type:'etf',industry:'小盘宽基',watch:true,benchmark:true,base:2.34,topic:'中证1000',manager:'南方',source:IDENTITY_SOURCES.n1000},
- {code:'159915',name:'创业板ETF易方达',shortName:'创业板ETF',type:'etf',industry:'成长宽基',watch:true,benchmark:true,base:2.55,topic:'创业板',manager:'易方达',source:IDENTITY_SOURCES.efund}
+ {code:'159915',name:'创业板ETF易方达',shortName:'创业板ETF',type:'etf',industry:'成长宽基',watch:true,benchmark:true,base:2.55,topic:'创业板',manager:'易方达',source:IDENTITY_SOURCES.efund},
+ // base is only an anchor for the labeled synthetic dataset; real prices come from providers.
+ {code:'510050',name:'上证50ETF华夏',shortName:'50ETF',type:'etf',industry:'上证50宽基',watch:true,base:1,topic:'上证50',manager:'华夏'},
+ {code:'159919',name:'沪深300ETF嘉实',shortName:'沪深300ETF嘉实',type:'etf',industry:'大盘宽基',watch:true,base:1,topic:'沪深300',manager:'嘉实'},
+ {code:'588000',name:'科创50ETF华夏',shortName:'科创50',type:'etf',industry:'科创宽基',watch:true,base:1,topic:'科创50',manager:'华夏'},
+ {code:'159901',name:'深证100ETF易方达',shortName:'深证100ETF',type:'etf',industry:'深证100宽基',watch:true,base:1,topic:'深证100',manager:'易方达'},
+ {code:'159922',name:'中证500ETF嘉实',shortName:'中证500ETF嘉实',type:'etf',industry:'中盘宽基',watch:true,base:1,topic:'中证500',manager:'嘉实'}
 ];
 const BENCH_CODES=['510300','159338','510500','512100','159915','588080'];
 const WATCH_CODES=CATALOG.filter(asset=>asset.watch).map(asset=>asset.code);

@@ -1,4 +1,5 @@
 'use strict';
+const OPTION_UNDERLYING_CODES=['510050','510300','159919','510500','588000','588080','159901','159915','159922'];
 const WATCH_MARKET_NAMES={CN:'A股',HK:'港股',US:'美股'};
 const originalCatalog=new Map(CATALOG.map(a=>[a.code,{...a,market:a.market||'CN',currency:a.currency||'CNY',symbol:a.symbol||a.code}]));
 let watchSearch={sequence:0,query:'',market:'ALL',results:[],loading:false,error:'',timer:null,controller:null,busy:false};
@@ -31,18 +32,19 @@ function watchMarketOf(asset){
  return /^(US|HK)\./.exec(asset.code)?.[1]||'CN';
 }
 function watchMatchesCategory(asset,category){
- return category==='all'||asset.type===category||watchMarketOf(asset)===category;
+ return category==='options'?watchMarketOf(asset)==='CN'&&asset.type==='etf'&&OPTION_UNDERLYING_CODES.includes(asset.code):category==='all'||asset.type===category||watchMarketOf(asset)===category;
 }
 function managedFilteredStocks(){
  const category=state.filter||'all';
  const query=state.query?.toLowerCase();
- return WATCH_CODES.map(byCode).filter(a=>a&&watchMatchesCategory(a,category)&&(!query||
+ const rows=WATCH_CODES.map(byCode).filter(a=>a&&watchMatchesCategory(a,category)&&(!query||
   [a.name,a.code,a.symbol,a.industry,a.verified_name].filter(Boolean).some(value=>value.toLowerCase().includes(query))));
+ return category==='options'?rows.sort((a,b)=>OPTION_UNDERLYING_CODES.indexOf(a.code)-OPTION_UNDERLYING_CODES.indexOf(b.code)):rows;
 }
 function managedWatchlist(){
  const stocks=WATCH_CODES.map(byCode).filter(Boolean),category=state.filter||'all';
  const canManage=hasLocalServer&&mode==='local';
- const categories=[['all','全部'],...Object.entries(WATCH_MARKET_NAMES),['stock','股票'],['etf','ETF']];
+ const categories=[['all','全部'],...Object.entries(WATCH_MARKET_NAMES),['stock','股票'],['etf','ETF'],['options','期权标的']];
  const tabs=categories.map(([id,label])=>{
   const count=stocks.filter(asset=>watchMatchesCategory(asset,id)).length;
   return `<button type="button" class="filter-chip ${category===id?'active':''}" aria-pressed="${category===id}" onclick="state.filter='${id}';render()">${label} ${count}</button>`;
@@ -86,8 +88,8 @@ function sortWatchRows(list,sort=state.watchSort,valueOf=watchSortValue){
  }).map(row=>row.asset);
 }
 function watchSortButton(key,label,hint=''){
- const active=state.watchSort?.key===key,direction=active?state.watchSort.direction:null,next=direction==='asc'?'降序':'升序';
- return `<button class="watch-sort-button ${active?'active':''}" data-watch-sort="${key}" onclick="toggleWatchSort('${key}')" aria-label="${esc(label)}，点击${next}排列" title="${esc(hint||label)}；点击${next}">${esc(label)}<span aria-hidden="true">${direction==='asc'?'↑':direction==='desc'?'↓':'↕'}</span></button>`;
+ const active=state.watchSort?.key===key,direction=active?state.watchSort.direction:null,next=direction==='asc'?'降序':direction==='desc'?'恢复默认排序':'升序';
+ return `<button class="watch-sort-button ${active?'active':''}" data-watch-sort="${key}" onclick="toggleWatchSort('${key}')" aria-label="${esc(label)}，点击${next}" title="${esc(hint||label)}；点击${next}">${esc(label)}<span aria-hidden="true">${direction==='asc'?'↑':direction==='desc'?'↓':'↕'}</span></button>`;
 }
 function watchSortHeader(key,label,hint=''){
  const active=state.watchSort?.key===key||key==='samples'&&state.watchSort?.key==='asOf';
@@ -96,7 +98,8 @@ function watchSortHeader(key,label,hint=''){
 }
 function toggleWatchSort(key){
  if(!WATCH_SORT_KEYS.has(key))return;
- state.watchSort={key,direction:state.watchSort?.key===key&&state.watchSort.direction==='asc'?'desc':'asc'};
+ const old=state.watchSort;
+ state.watchSort=old?.key===key&&old.direction==='desc'?null:{key,direction:old?.key===key&&old.direction==='asc'?'desc':'asc'};
  const root=document.getElementById('watch-rows');
  if(!root){render();return}
  const scroll=root.querySelector('.table-wrap')?.scrollLeft||0;

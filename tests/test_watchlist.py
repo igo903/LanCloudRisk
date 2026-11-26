@@ -112,6 +112,51 @@ class WatchlistTests(unittest.TestCase):
             store.commit_snapshot({'catalog':store.catalog_view(),'instruments':{'US.NVDA':{'as_of':'2026-10-30','history_checked_at':'2026-11-02T10:00:00','bars':[1]}}})
             store.commit_snapshot({'catalog':store.catalog_view(),'instruments':{'002281':{'as_of':'2026-10-30'},'US.NVDA':{'as_of':'2026-10-29','history_checked_at':'2026-11-01T10:00:00'}}})
             self.assertEqual(store.snapshot['instruments']['US.NVDA']['bars'],[1])
+
+    def test_option_underlyings_added_to_version_one_catalog_once_without_resetting_other_choices(self):
+        codes = ('510050','510300','159919','510500','588000','588080','159901','159915','159922')
+        self.assertEqual(app.OPTION_UNDERLYING_CODES, codes)
+        original_benchmarks = {'510300','159338','510500','512100','159915','588080'}
+        self.assertEqual(app.BENCHMARK_CODES, original_benchmarks)
+        with tempfile.TemporaryDirectory() as folder:
+            p = Path(folder)/'cache.json'
+            new_codes = {'510050','159919','588000','159901','159922'}
+            catalog = {c:m for c,m in app.base_catalog().items() if c not in new_codes}
+            catalog['US.NVDA'] = META.copy()
+            for code in ('002281','512100','588080'):
+                catalog[code]['watch'] = False
+            stamp = '2026-11-25T15:30:00+08:00'
+            p.write_text(json.dumps({'data_kind':'local', 'catalog':list(catalog.values()),
+                                     'instruments':{}, 'watchlist_defaults_version':1,
+                                     'watchlist_revision':10, 'fetched_at':stamp}))
+            migrated = self.store(p)
+            self.assertEqual(migrated.watchlist_revision,11)
+            self.assertEqual(migrated.snapshot['watchlist_defaults_version'],2)
+            self.assertEqual(migrated.snapshot['fetched_at'],stamp)
+            self.assertEqual(migrated.snapshot['instruments'],{})
+            self.assertTrue(all(migrated.catalog[c]['watch'] for c in codes))
+            self.assertTrue(all(migrated.catalog[c]['type']=='etf' for c in codes))
+            self.assertEqual({c:m['provider_symbol'] for c,m in migrated.catalog.items() if c in new_codes},
+                             {c:('sh' if c.startswith('5') else 'sz')+c for c in new_codes})
+            self.assertTrue(migrated.catalog['US.NVDA']['watch'])
+            for code in ('002281','512100'):
+                self.assertFalse(migrated.catalog[code]['watch'])
+            view=migrated.catalog_view()
+            self.assertEqual(len(view),len({m['code'] for m in view}))
+            restored = self.store(p)
+            self.assertEqual(restored.watchlist_revision,11)
+            restored.remove_watch('510050',11)
+            restored.remove_watch('588080',12)
+            restarted = self.store(p)
+            self.assertEqual(restarted.watchlist_revision,13)
+            self.assertFalse(restarted.catalog['510050']['watch'])
+            self.assertFalse(restarted.catalog['588080']['watch'])
+
+    def test_new_installation_has_all_nine_option_etfs_in_watchlist(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = self.store(Path(folder)/'cache.json')
+            self.assertTrue(all(store.catalog[c]['watch'] for c in app.OPTION_UNDERLYING_CODES))
+            self.assertEqual(store.watchlist_revision,0)
     def test_single_stock_refresh_retains_funds_when_provider_returns_empty(self):
         with tempfile.TemporaryDirectory() as folder:
             store=self.store(Path(folder)/'cache.json')

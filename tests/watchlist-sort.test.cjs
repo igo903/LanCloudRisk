@@ -19,13 +19,34 @@ test('names sort naturally and dates sort chronologically',()=>{
 test('unknown sort columns preserve the original order',()=>{
  const rows=[{id:'a',value:1},{id:'b',value:2}];assert.deepEqual(codes(sort(rows,{key:'manage',direction:'desc'},byValue)),['a','b']);assert.deepEqual(codes(sort(rows,null,byValue)),['a','b']);
 });
-test('header toggles ascending and descending with accessible direction and keyboard focus',()=>{
+test('header cycles ascending, descending and default with accessible next actions',()=>{
  context.document={getElementById:()=>null};context.render=()=>{};
  vm.runInContext("toggleWatchSort('ret5')",context);assert.equal(vm.runInContext('state.watchSort.direction',context),'asc');
  let html=vm.runInContext("watchSortHeader('ret5','5日表现')",context);assert.match(html,/aria-sort="ascending"/);assert.match(html,/点击降序/);
  vm.runInContext("toggleWatchSort('ret5')",context);assert.equal(vm.runInContext('state.watchSort.direction',context),'desc');
+ html=vm.runInContext("watchSortHeader('ret5','5日表现')",context);assert.match(html,/点击恢复默认排序/);
+ vm.runInContext("toggleWatchSort('ret5')",context);assert.equal(vm.runInContext('state.watchSort',context),null);
+ html=vm.runInContext("watchSortHeader('ret5','5日表现')",context);assert.match(html,/aria-sort="none"/);assert.match(html,/点击升序/);assert.match(html,/↕/);
+ const rows=[{id:'missing',value:null},{id:'high',value:8},{id:'low',value:-2}];
+ assert.deepEqual(codes(sort(rows,vm.runInContext('state.watchSort',context),byValue)),['missing','high','low']);
  vm.runInContext("toggleWatchSort('name')",context);assert.equal(vm.runInContext('state.watchSort.direction',context),'asc');
  vm.runInContext("toggleWatchSort('asOf')",context);html=vm.runInContext("watchSortHeader('samples','样本 / 数据时间')",context);assert.match(html,/aria-sort="ascending"/);assert.match(html,/data-watch-sort="asOf"/);
+});
+
+test('option underlyings share the single category row and restore screenshot order after sorting',()=>{
+ const optionCodes=['510050','510300','159919','510500','588000','588080','159901','159915','159922'];
+ const stocks=[{code:'US.510050',market:'US',type:'etf',name:'foreign'},...optionCodes.slice().reverse().map((code,i)=>({code,name:'ETF '+code,type:'etf',value:i}))];
+ Object.assign(context,{WATCH_CODES:stocks.map(a=>a.code),byCode:code=>stocks.find(a=>a.code===code),hasLocalServer:true,mode:'local',localStatus:null,render(){},title:()=>'',button:()=>'',icon:()=>'',filteredStocks:context.window.filteredStocks,watchTable:()=>'',state:{filter:'options',query:''}});
+ const listed=()=>Array.from(vm.runInContext('managedFilteredStocks()',context),a=>a.code);
+ assert.deepEqual(listed(),optionCodes);
+ const html=vm.runInContext('managedWatchlist()',context);assert.equal((html.match(/class="filter-tabs/g)||[]).length,1);assert.match(html,/>期权标的 9<\/button>/);assert.match(html,/>ETF 10<\/button>/);
+ context.state.query='1599';assert.deepEqual(listed(),['159919','159901','159915','159922']);context.state.query='';
+ const rows=vm.runInContext('managedFilteredStocks()',context);
+ vm.runInContext("toggleWatchSort('ret5');toggleWatchSort('ret5');toggleWatchSort('ret5')",context);
+ assert.deepEqual(Array.from(sort(rows,context.state.watchSort,byValue),a=>a.code),optionCodes);
+ context.WATCH_CODES=context.WATCH_CODES.filter(code=>code!=='510050');assert.deepEqual(listed(),optionCodes.slice(1));
+ assert.match(vm.runInContext('managedWatchlist()',context),/>期权标的 8<\/button>/);
+ assert.equal(vm.runInContext("watchMatchesCategory({code:'510050',type:'stock'},'options')",context),false);
 });
 
 test('all six watch fund columns sort numeric amounts, retain zero and keep missing last',()=>{

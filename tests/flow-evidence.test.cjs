@@ -28,6 +28,7 @@ test('all eight evidence headers sort by raw values with missing last and preser
  assert.ok(initial.indexOf('2026-10-30')<initial.indexOf('2026-10-21'));
  h.run("toggleRiskSort('flows','flow20')");let html=h.run('flowTable(sample)');assert.ok(html.indexOf('2026-10-21')<html.indexOf('2026-10-30'));assert.match(html,/aria-sort="ascending"/);
  h.run("toggleRiskSort('flows','flow20')");html=h.run('flowTable(sample)');assert.ok(html.indexOf('2026-10-30')<html.indexOf('2026-10-21'));assert.match(html,/aria-sort="descending"/);assert.match(html,/截至各行日期并包含当日/);
+ h.run("toggleRiskSort('flows','flow20')");html=h.run('flowTable(sample)');assert.ok(html.indexOf('2026-10-30')<html.indexOf('2026-10-21'));assert.match(html,/aria-sort="none"/);
  h.run("sample.flows=[{date:'2026-10-01',netFlow:null},{date:'2026-10-02',netFlow:0},{date:'2026-10-03',netFlow:-5}];toggleRiskSort('flows','netFlow')");html=h.run('flowTable(sample)');assert.ok(html.indexOf('2026-10-03')<html.indexOf('2026-10-02'));assert.ok(html.indexOf('2026-10-02')<html.indexOf('2026-10-01'));
 });
 
